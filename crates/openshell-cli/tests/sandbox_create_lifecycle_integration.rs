@@ -736,6 +736,13 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
 
+    // Bind to port 0 to get an available port from the OS, then release it for
+    // the sandbox_create call to use. There is a small TOCTOU window here, but
+    // it is sufficient for testing purposes.
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let free_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
     run::sandbox_create(
         &server.endpoint,
         Some("persistent-forward"),
@@ -750,7 +757,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         &[],
         None,
-        Some(openshell_core::forward::ForwardSpec::new(8080)),
+        Some(openshell_core::forward::ForwardSpec::new(free_port)),
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
