@@ -1306,6 +1306,15 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
+        /// Sandbox execution mode.
+        ///
+        /// `nested` grants elevated capabilities for running inner container
+        /// engines (e.g., Docker-in-Docker, Podman-in-Podman) inside the
+        /// sandbox. OpenShell network policies are not enforced in nested
+        /// mode. Defaults to `supervised` (full OpenShell isolation).
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
+
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -2461,6 +2470,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    mode,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2516,6 +2526,18 @@ async fn main() -> Result<()> {
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
 
+                    // Parse --mode into an i32 for the proto SandboxTemplate.
+                    let sandbox_mode: i32 = match mode.as_deref() {
+                        None | Some("supervised") => 0, // SANDBOX_MODE_UNSPECIFIED
+                        Some("nested") => 2,            // SANDBOX_MODE_NESTED
+                        Some(other) => {
+                            return Err(miette::miette!(
+                                "unknown sandbox mode '{}'; valid values: nested, supervised",
+                                other
+                            ));
+                        }
+                    };
+
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
                     match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
@@ -2556,6 +2578,7 @@ async fn main() -> Result<()> {
                                 Some(false),
                                 auto_providers_override,
                                 &labels_map,
+                                sandbox_mode,
                                 &tls,
                             ))
                             .await?;
@@ -2579,6 +2602,7 @@ async fn main() -> Result<()> {
                                 tty_override,
                                 bootstrap_override,
                                 auto_providers_override,
+                                sandbox_mode,
                             ))
                             .await?;
                         }

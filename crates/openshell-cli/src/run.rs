@@ -2131,6 +2131,7 @@ pub async fn sandbox_create_with_bootstrap(
     tty_override: Option<bool>,
     bootstrap_override: Option<bool>,
     auto_providers_override: Option<bool>,
+    sandbox_mode: i32,
 ) -> Result<()> {
     if !crate::bootstrap::confirm_bootstrap(bootstrap_override)? {
         return Err(miette::miette!(
@@ -2168,6 +2169,7 @@ pub async fn sandbox_create_with_bootstrap(
         Some(false),
         auto_providers_override,
         &HashMap::new(),
+        sandbox_mode,
         &tls,
     ))
     .await
@@ -2225,6 +2227,7 @@ pub async fn sandbox_create(
     bootstrap_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    sandbox_mode: i32,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -2317,8 +2320,9 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
 
-    let template = image.map(|img| SandboxTemplate {
-        image: img,
+    let template = Some(SandboxTemplate {
+        image: image.unwrap_or_default(),
+        mode: sandbox_mode,
         ..SandboxTemplate::default()
     });
 

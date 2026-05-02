@@ -6,6 +6,9 @@
 # Start a standalone openshell-gateway backed by the Podman compute driver for
 # local manual testing.
 #
+# The gateway always starts in standard (supervised) mode. Sandbox isolation
+# mode is a per-sandbox setting — clients select it at sandbox creation time.
+#
 # Defaults:
 # - Plaintext HTTP on 127.0.0.1:18081
 # - Dedicated sandbox namespace "podman-dev"
@@ -19,16 +22,15 @@
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:podman
 #   OPENSHELL_SUPERVISOR_IMAGE=openshell/supervisor:dev mise run gateway:podman
 #
-# Passthrough mode (no supervisor, nested containers enabled):
-#   OPENSHELL_PODMAN_PASSTHROUGH=1 \
-#   OPENSHELL_SANDBOX_IMAGE=ghcr.io/bootc-dev/devenv-debian \
-#   mise run gateway:podman
+# To create a sandbox with nested container support (inner Podman):
+#   openshell sandbox create --image devenv-debian --mode nested
 #
-# With GCP Application Default Credentials for opencode (passthrough mode):
-#   OPENSHELL_PODMAN_PASSTHROUGH=1 \
-#   OPENSHELL_SANDBOX_IMAGE=ghcr.io/bootc-dev/devenv-debian \
+# With GCP Application Default Credentials for opencode:
 #   OPENSHELL_PODMAN_ADC_PATH=~/.config/gcloud/application_default_credentials.json \
 #   mise run gateway:podman
+#
+# Environment variable overrides:
+#   OPENSHELL_SKIP_SUPERVISOR_CHECK=1  Skip supervisor image check (for nested-only gateway use)
 #
 # The ADC file is bind-mounted read-only at /run/gcloud/adc.json inside the
 # container and GOOGLE_APPLICATION_CREDENTIALS is set automatically.
@@ -44,30 +46,17 @@ PORT="${OPENSHELL_SERVER_PORT:-18081}"
 GATEWAY_NAME="${OPENSHELL_PODMAN_GATEWAY_NAME:-podman-dev}"
 STATE_DIR="${OPENSHELL_PODMAN_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-podman}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-podman-dev}"
+SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-missing}"
 SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 
-# Passthrough mode: skip supervisor injection and inner sandboxing.
-# Required for nested containerization (podman-in-podman) and for images
-# like ghcr.io/bootc-dev/devenv-debian that embed their own agent binary.
-PASSTHROUGH="${OPENSHELL_PODMAN_PASSTHROUGH:-}"
-
 # Optional: host path to a GCP Application Default Credentials JSON file.
-# When set, the file is bind-mounted read-only into passthrough-mode containers
-# at /run/gcloud/adc.json and GOOGLE_APPLICATION_CREDENTIALS is set automatically.
+# When set, the file is bind-mounted read-only into containers at
+# /run/gcloud/adc.json and GOOGLE_APPLICATION_CREDENTIALS is set automatically.
 # Example: OPENSHELL_PODMAN_ADC_PATH=~/.config/gcloud/application_default_credentials.json
 ADC_PATH="${OPENSHELL_PODMAN_ADC_PATH:-}"
-
-# Default sandbox image differs by mode:
-#   supervised  → community base image (requires supervisor sideload)
-#   passthrough → devenv-debian (has opencode + dev tools built in)
-if [[ -n "${PASSTHROUGH}" ]]; then
-  SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/bootc-dev/devenv-debian}"
-else
-  SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
-fi
 
 port_is_in_use() {
   local port=$1
@@ -118,14 +107,16 @@ if ! podman info >/dev/null 2>&1; then
   exit 2
 fi
 
-# In supervised mode, the supervisor image must exist locally.
-if [[ -z "${PASSTHROUGH}" ]]; then
-  if ! podman image exists "${SUPERVISOR_IMAGE}" 2>/dev/null; then
-    echo "ERROR: supervisor image '${SUPERVISOR_IMAGE}' not found locally." >&2
-    echo "Build it with: mise run build:docker:supervisor-sideload" >&2
-    echo "Or run in passthrough mode: OPENSHELL_PODMAN_PASSTHROUGH=1 mise run gateway:podman" >&2
-    exit 2
-  fi
+# The supervisor image must exist locally for supervised mode.
+# Set OPENSHELL_SKIP_SUPERVISOR_CHECK=1 to skip this check (for nested-only gateway use).
+if [[ "${OPENSHELL_SKIP_SUPERVISOR_CHECK:-}" == "1" ]]; then
+  echo "WARNING: Skipping supervisor image check (OPENSHELL_SKIP_SUPERVISOR_CHECK=1)"
+  echo "         Supervised sandboxes will fail if image '${SUPERVISOR_IMAGE}' is not present."
+elif ! podman image exists "${SUPERVISOR_IMAGE}" 2>/dev/null; then
+  echo "ERROR: supervisor image '${SUPERVISOR_IMAGE}' not found locally." >&2
+  echo "Build it with: mise run build:docker:supervisor-load" >&2
+  echo "Or set OPENSHELL_SKIP_SUPERVISOR_CHECK=1 to skip this check (nested-only use)." >&2
+  exit 2
 fi
 
 if port_is_in_use "${PORT}"; then
@@ -146,22 +137,15 @@ mkdir -p "${STATE_DIR}"
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
 
-# Generate a handshake secret for this session (used in supervised mode only).
+# Generate a handshake secret for this session.
 SSH_HANDSHAKE_SECRET="${OPENSHELL_SSH_HANDSHAKE_SECRET:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 
-if [[ -n "${PASSTHROUGH}" ]]; then
-  echo "Starting standalone Podman gateway (PASSTHROUGH mode — nested containers enabled)..."
-else
-  echo "Starting standalone Podman gateway (supervised mode)..."
-fi
+echo "Starting standalone Podman gateway (supervised mode)..."
 echo "  gateway:          ${GATEWAY_NAME}"
 echo "  endpoint:         ${GATEWAY_ENDPOINT}"
 echo "  namespace:        ${SANDBOX_NAMESPACE}"
 echo "  sandbox image:    ${SANDBOX_IMAGE}"
-if [[ -z "${PASSTHROUGH}" ]]; then
-  echo "  supervisor image: ${SUPERVISOR_IMAGE}"
-fi
-echo "  passthrough:      ${PASSTHROUGH:-false}"
+echo "  supervisor image: ${SUPERVISOR_IMAGE}"
 if [[ -n "${ADC_PATH}" ]]; then
   echo "  adc host path:    ${ADC_PATH}"
 fi
@@ -171,10 +155,12 @@ echo "Point the CLI at this gateway with one of:"
 echo "  openshell --gateway ${GATEWAY_NAME} status"
 echo "  openshell gateway select ${GATEWAY_NAME}"
 echo
+echo "To create a sandbox with nested container support:"
+echo "  openshell sandbox create --image devenv-debian --mode nested"
+echo
 
 OPENSHELL_SSH_HANDSHAKE_SECRET="${SSH_HANDSHAKE_SECRET}" \
 OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
-OPENSHELL_PODMAN_PASSTHROUGH="${PASSTHROUGH}" \
 OPENSHELL_PODMAN_ADC_PATH="${ADC_PATH}" \
 exec "${GATEWAY_BIN}" \
   --port "${PORT}" \
