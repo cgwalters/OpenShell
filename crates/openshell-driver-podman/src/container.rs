@@ -63,14 +63,21 @@ struct ContainerSpec {
     labels: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
     volumes: Vec<NamedVolume>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     image_volumes: Vec<ImageVolume>,
     hostname: String,
     /// Overrides the image's ENTRYPOINT. In Podman's libpod API, `command`
     /// only overrides CMD (appended as args to the entrypoint). We must set
     /// `entrypoint` explicitly so the supervisor binary runs directly,
     /// regardless of what ENTRYPOINT the sandbox image defines.
+    ///
+    /// In passthrough mode this is set to `["sleep"]` so the container stays
+    /// alive regardless of the image's CMD (e.g. "bash" exits without a TTY).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     entrypoint: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     command: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
     user: String,
     cap_drop: Vec<String>,
     cap_add: Vec<String>,
@@ -83,6 +90,7 @@ struct ContainerSpec {
     /// Podman's libpod `SpecGenerator` uses `secret_env` (a flat map) for
     /// environment-variable injection, distinct from `secrets` which only
     /// handles file-mounted secrets under `/run/secrets/`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     secret_env: BTreeMap<String, String>,
     stop_timeout: u32,
     /// Extra /etc/hosts entries. Used to inject `host.containers.internal`
@@ -98,10 +106,29 @@ struct ContainerSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     devices: Option<Vec<LinuxDevice>>,
     /// Extra mounts for the libpod `SpecGenerator` (e.g. tmpfs entries).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     mounts: Vec<Mount>,
     /// Port mappings from host to container. Using `host_port=0` requests an
     /// ephemeral port, readable back from the inspect response.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     portmappings: Vec<PortMapping>,
+    /// Paths to unmask in /proc and /sys for nested-container support.
+    ///
+    /// Podman's libpod `SpecGenerator` `unmask` field accepts a list of paths
+    /// to expose inside the container that are ordinarily masked/read-only
+    /// for security. Required for nested podman to read `/proc/*` and manage
+    /// cgroups under `/sys/fs/cgroup`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unmask: Vec<String>,
+    /// `SELinux` process label options.
+    ///
+    /// The libpod `SpecGenerator` `selinux_opts` field corresponds to the
+    /// CLI `--security-opt label=<value>` flag. Setting `["disable"]` is
+    /// equivalent to `--security-opt label=disable`, which disables `SELinux`
+    /// confinement for the container — necessary for nested containers to
+    /// bind-mount host paths and manage their own overlayfs layers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    selinux_opts: Vec<String>,
 }
 
 /// A port mapping entry for the libpod `SpecGenerator`.
@@ -263,6 +290,53 @@ fn build_env(
     env
 }
 
+/// Build environment variables for passthrough-mode containers.
+///
+/// Injects only informational and user-supplied vars. No supervisor-specific
+/// vars (`OPENSHELL_SSH_*`, `OPENSHELL_ENDPOINT`) because there is no supervisor.
+fn build_env_passthrough(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    image: &str,
+) -> BTreeMap<String, String> {
+    let spec = sandbox.spec.as_ref();
+    let template = spec.and_then(|s| s.template.as_ref());
+
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+
+    // User-supplied environment.
+    if let Some(s) = spec {
+        if !s.log_level.is_empty() {
+            env.insert("OPENSHELL_LOG_LEVEL".into(), s.log_level.clone());
+        }
+        for (k, v) in &s.environment {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(t) = template {
+        for (k, v) in &t.environment {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Inject GOOGLE_APPLICATION_CREDENTIALS pointing at the in-container ADC
+    // mount path. Only set if the user hasn't already provided it, so callers
+    // can still override via spec.environment.
+    if config.adc_host_path.is_some() {
+        env.entry("GOOGLE_APPLICATION_CREDENTIALS".into())
+            .or_insert_with(|| "/run/gcloud/adc.json".into());
+    }
+
+    // Informational vars (cannot be overridden by user).
+    env.insert("OPENSHELL_SANDBOX".into(), sandbox.name.clone());
+    env.insert("OPENSHELL_SANDBOX_ID".into(), sandbox.id.clone());
+    env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
+    // Signal to processes inside that they are running in OpenShell passthrough mode.
+    env.insert("OPENSHELL_PASSTHROUGH".into(), "1".into());
+
+    env
+}
+
 /// Merge labels from the sandbox template with required managed labels.
 ///
 /// User-supplied labels are inserted first so that the managed labels
@@ -325,6 +399,136 @@ fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
 /// Build the Podman container creation JSON spec.
 #[must_use]
 pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
+    if config.passthrough {
+        build_container_spec_passthrough(sandbox, config)
+    } else {
+        build_container_spec_supervised(sandbox, config)
+    }
+}
+
+/// Build a passthrough container spec: no supervisor injection, no inner sandboxing.
+///
+/// The container uses the image's own ENTRYPOINT/CMD and runs with the kernel
+/// permissions needed for nested containerization (`unmask`, `selinux_opts`,
+/// `no_new_privileges=false`). User-supplied environment variables are passed
+/// through directly — the caller is responsible for injecting API keys etc.
+fn build_container_spec_passthrough(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+) -> Value {
+    let image = resolve_image(sandbox, config);
+    let name = container_name(&sandbox.name);
+    let vol = volume_name(&sandbox.id);
+
+    let env = build_env_passthrough(sandbox, config, image);
+    let labels = build_labels(sandbox);
+    let resource_limits = build_resource_limits(sandbox);
+    let devices = build_devices(sandbox);
+
+    #[allow(clippy::zero_sized_map_values)]
+    let mut networks = BTreeMap::new();
+    networks.insert(config.network_name.clone(), NetworkAttachment {});
+
+    let container_spec = ContainerSpec {
+        name,
+        image: image.to_string(),
+        labels,
+        env,
+        volumes: vec![NamedVolume {
+            name: vol,
+            dest: "/sandbox".into(),
+            options: vec!["rw".into()],
+        }],
+        // No supervisor sideload in passthrough mode.
+        image_volumes: vec![],
+        hostname: format!("sandbox-{}", sandbox.name),
+        // Override the image's ENTRYPOINT to run sleep(1) directly, so the
+        // container stays alive even if the image's CMD (e.g. "bash") would
+        // exit immediately without a TTY. We clear entrypoint so the kernel
+        // exec()s "sleep" directly (no shell wrapper needed), and set command
+        // to ["infinity"] as the sole argument. This matches the behavior of
+        // `podman run --entrypoint sleep <image> infinity`.
+        entrypoint: vec!["sleep".into()],
+        command: vec!["infinity".into()],
+        // Run as root so nested container tools (podman, buildah) have the
+        // permissions needed to manage storage, create namespaces, and call
+        // newuidmap/newgidmap for rootless inner containers.
+        user: "0:0".into(),
+        // Minimal capability drop for passthrough mode. We keep SYS_ADMIN and
+        // NET_ADMIN for nested podman and drop only clearly unnecessary caps.
+        cap_drop: vec!["NET_BIND_SERVICE".into(), "NET_RAW".into()],
+        cap_add: vec![
+            // Required for nested container runtimes (unshare, mount, etc.).
+            "SYS_ADMIN".into(),
+            // Required for inner network namespace creation.
+            "NET_ADMIN".into(),
+        ],
+        // Must be false: nested container runtimes need privilege transitions
+        // (e.g. newuidmap/newgidmap for rootless inner containers).
+        no_new_privileges: false,
+        // Outer seccomp must be unconfined so the inner runtime can install
+        // its own seccomp filter and use mount/clone/unshare syscalls.
+        seccomp_profile_path: "unconfined".into(),
+        image_pull_policy: config.image_pull_policy.as_str().to_string(),
+        // Simple liveness check: container process (PID 1) exists.
+        healthconfig: HealthConfig {
+            test: vec!["CMD-SHELL".into(), "test -f /proc/1/status".into()],
+            interval: 10_000_000_000,
+            timeout: 5_000_000_000,
+            retries: 3,
+            start_period: 5_000_000_000,
+        },
+        resource_limits,
+        // No SSH handshake secret in passthrough mode (no supervisor).
+        secret_env: BTreeMap::new(),
+        stop_timeout: config.stop_timeout_secs,
+        hostadd: vec!["host.containers.internal:host-gateway".into()],
+        netns: NetNS {
+            nsmode: "bridge".to_string(),
+        },
+        networks,
+        // Add /dev/fuse so inner rootless Podman can use fuse-overlayfs as
+        // its storage driver. Without this, rootless containers inside the
+        // sandbox fall back to vfs (slow/large) or fail entirely on kernels
+        // that don't support native overlayfs in user namespaces.
+        devices: {
+            let mut devs = devices.unwrap_or_default();
+            devs.push(LinuxDevice {
+                path: "/dev/fuse".into(),
+            });
+            Some(devs)
+        },
+        // Bind-mount the host ADC JSON file read-only when configured.
+        // The container path is always /run/gcloud/adc.json, paired with
+        // GOOGLE_APPLICATION_CREDENTIALS set by build_env_passthrough.
+        mounts: config
+            .adc_host_path
+            .as_ref()
+            .map_or_else(Vec::new, |host_path| {
+                vec![Mount {
+                    kind: "bind".into(),
+                    source: host_path.to_string_lossy().into_owned(),
+                    destination: "/run/gcloud/adc.json".into(),
+                    options: vec!["ro".into(), "rbind".into()],
+                }]
+            }),
+        // No SSH port published (no supervisor SSH server).
+        portmappings: vec![],
+        // Unmask /proc/* and /sys/fs/cgroup so the inner container runtime
+        // can read process info and manage cgroups. Without these, Podman
+        // inside the container fails when trying to inspect or create containers.
+        unmask: vec!["/proc/*".into(), "/sys/fs/cgroup".into()],
+        // Disable SELinux confinement for the container. Inner container
+        // runtimes need to create bind mounts and manage overlayfs layers;
+        // SELinux label enforcement blocks these on SELinux-enabled hosts.
+        selinux_opts: vec!["disable".into()],
+    };
+
+    serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
+}
+
+/// Build a supervised container spec: supervisor binary injected, inner sandboxing active.
+fn build_container_spec_supervised(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
@@ -501,6 +705,11 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             container_port: config.ssh_port,
             protocol: "tcp".into(),
         }],
+        // Supervised mode does not need unmask or selinux_opts overrides —
+        // the supervisor manages its own namespaces and does not require
+        // nested container support.
+        unmask: vec![],
+        selinux_opts: vec![],
     };
 
     serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
@@ -886,6 +1095,150 @@ mod tests {
             vol["rw"].as_bool(),
             Some(false),
             "image volume should be read-only"
+        );
+    }
+
+    #[test]
+    fn passthrough_spec_includes_adc_bind_mount_when_configured() {
+        let sandbox = test_sandbox("adc-test-id", "adc-test");
+        let config = PodmanComputeConfig {
+            passthrough: true,
+            adc_host_path: Some(std::path::PathBuf::from("/host/adc.json")),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert_eq!(mounts.len(), 1, "should have exactly one mount for ADC");
+
+        let mount = &mounts[0];
+        assert_eq!(mount["type"].as_str(), Some("bind"));
+        assert_eq!(mount["source"].as_str(), Some("/host/adc.json"));
+        assert_eq!(mount["destination"].as_str(), Some("/run/gcloud/adc.json"));
+        let empty = vec![];
+        let has_ro = mount["options"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|o| o == "ro");
+        assert!(has_ro, "ADC mount should be read-only");
+    }
+
+    #[test]
+    fn passthrough_spec_sets_google_credentials_env_when_adc_configured() {
+        let sandbox = test_sandbox("adc-env-id", "adc-env");
+        let config = PodmanComputeConfig {
+            passthrough: true,
+            adc_host_path: Some(std::path::PathBuf::from("/host/adc.json")),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+
+        let env = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env.get("GOOGLE_APPLICATION_CREDENTIALS")
+                .and_then(|v| v.as_str()),
+            Some("/run/gcloud/adc.json"),
+            "GOOGLE_APPLICATION_CREDENTIALS should point to in-container ADC path"
+        );
+    }
+
+    #[test]
+    fn passthrough_spec_no_adc_mount_when_not_configured() {
+        let sandbox = test_sandbox("no-adc-id", "no-adc");
+        let config = PodmanComputeConfig {
+            passthrough: true,
+            adc_host_path: None,
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+
+        // mounts is skipped entirely when empty (skip_serializing_if = "Vec::is_empty")
+        let mounts = spec["mounts"].as_array();
+        assert!(
+            mounts.is_none_or(Vec::is_empty),
+            "no mounts without ADC config"
+        );
+
+        // GOOGLE_APPLICATION_CREDENTIALS must not be injected either
+        let env = spec["env"].as_object().expect("env should be an object");
+        assert!(
+            !env.contains_key("GOOGLE_APPLICATION_CREDENTIALS"),
+            "GOOGLE_APPLICATION_CREDENTIALS must not be set without ADC config"
+        );
+    }
+
+    #[test]
+    fn passthrough_spec_user_env_wins_over_adc_credentials_path() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("user-env-id", "user-env");
+        let mut env_map = std::collections::HashMap::new();
+        env_map.insert(
+            "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+            "/my/custom/creds.json".to_string(),
+        );
+        sandbox.spec = Some(DriverSandboxSpec {
+            environment: env_map,
+            template: Some(DriverSandboxTemplate {
+                image: "test-image:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let config = PodmanComputeConfig {
+            passthrough: true,
+            adc_host_path: Some(std::path::PathBuf::from("/host/adc.json")),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+
+        let env = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env.get("GOOGLE_APPLICATION_CREDENTIALS")
+                .and_then(|v| v.as_str()),
+            Some("/my/custom/creds.json"),
+            "user-supplied GOOGLE_APPLICATION_CREDENTIALS should not be overridden"
+        );
+    }
+
+    #[test]
+    fn passthrough_spec_uses_sleep_infinity_to_keep_container_alive() {
+        let sandbox = test_sandbox("sleep-test-id", "sleep-test");
+        let config = PodmanComputeConfig {
+            passthrough: true,
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+
+        // Passthrough containers must default to `sleep infinity` so they stay
+        // alive regardless of the image's CMD (e.g. devenv-debian sets CMD=bash
+        // which exits immediately without a TTY).
+        let entrypoint: Vec<&str> = spec["entrypoint"]
+            .as_array()
+            .expect("entrypoint should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            entrypoint,
+            vec!["sleep"],
+            "passthrough entrypoint should be sleep"
+        );
+
+        let command: Vec<&str> = spec["command"]
+            .as_array()
+            .expect("command should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            command,
+            vec!["infinity"],
+            "passthrough command should be infinity"
         );
     }
 }
