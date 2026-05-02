@@ -226,6 +226,9 @@ message SandboxTemplate {
   map<string, string> environment = 6;
   // Platform-specific compute resource requirements and limits.
   google.protobuf.Struct resources = 7;
+  // Sandbox execution mode. Defaults to supervised (SANDBOX_MODE_UNSPECIFIED).
+  // See SandboxMode for details.
+  SandboxMode mode = 8;
   // Optional platform-specific volume claim templates.
   google.protobuf.Struct volume_claim_templates = 9;
 }
@@ -272,6 +275,28 @@ enum SandboxPhase {
   SANDBOX_PHASE_ERROR = 3;
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
+}
+
+// Sandbox execution mode controlling isolation level and supervisor behavior.
+//
+// SANDBOX_MODE_UNSPECIFIED (0) is the default and selects supervised mode —
+// the full OpenShell runtime with a sideloaded supervisor binary, Landlock,
+// seccomp, and network-namespace egress enforcement.
+//
+// SANDBOX_MODE_NESTED (2) uses the compute engine's default container runtime
+// without a supervisor, but grants elevated Linux capabilities (SYS_ADMIN,
+// NET_ADMIN), disables seccomp and SELinux confinement, unmasks /proc/* and
+// /sys/fs/cgroup, and mounts /dev/fuse. This is intended for workloads that
+// need to run inner container engines (e.g. Podman-in-Podman). Isolation is
+// provided by the host's container runtime only; OpenShell network policies
+// and Landlock filesystem controls are NOT enforced.
+//
+// Value 1 is intentionally left unassigned and reserved for a future
+// ENGINE_DEFAULT mode (plain container, image's own entrypoint, no supervisor,
+// no elevated caps).
+enum SandboxMode {
+  SANDBOX_MODE_UNSPECIFIED = 0;
+  SANDBOX_MODE_NESTED = 2;
 }
 
 // Public platform event exposed on the sandbox watch stream.

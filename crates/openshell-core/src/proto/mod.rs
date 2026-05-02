@@ -79,6 +79,12 @@ pub mod inference {
     }
 }
 
+// prost generates `super::super::v1::SandboxMode` for cross-package refs from
+// openshell.compute.v1 → openshell.v1. The module path resolves as
+// proto::compute::v1 → super::super = proto (this module) → v1.
+// This alias maps that to the openshell module which contains the v1 types.
+pub use openshell as v1;
+
 pub use datamodel::v1::*;
 pub use inference::v1::*;
 pub use openshell::*;

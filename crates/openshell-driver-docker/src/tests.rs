@@ -28,6 +28,7 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 resources: None,
                 platform_config: None,
+                mode: 0,
             }),
             gpu: false,
             gpu_device: String::new(),
@@ -100,6 +101,7 @@ fn docker_resource_limits_rejects_requests() {
             memory_limit: String::new(),
         }),
         platform_config: None,
+        mode: 0,
     };
 
     let err = docker_resource_limits(&template).unwrap_err();
@@ -191,6 +193,48 @@ fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("Docker CDI"));
+}
+
+#[test]
+fn validate_sandbox_rejects_non_default_mode() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    // mode 2 = SANDBOX_MODE_NESTED
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .mode = 2;
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("not supported by the Docker compute driver")
+    );
+}
+
+#[test]
+fn validate_sandbox_accepts_default_mode() {
+    let config = runtime_config();
+    let sandbox = test_sandbox();
+    // mode 0 = SANDBOX_MODE_UNSPECIFIED (default)
+    assert_eq!(
+        sandbox
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .as_ref()
+            .unwrap()
+            .mode,
+        0
+    );
+    DockerComputeDriver::validate_sandbox(&sandbox, &config).expect("mode 0 should be accepted");
 }
 
 #[test]

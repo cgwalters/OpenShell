@@ -18,6 +18,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use openshell_core::proto::openshell::SandboxMode;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
@@ -194,6 +195,8 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
+        check_sandbox_mode(sandbox)?;
+
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
         if gpu_requested
             && !self.has_gpu_capacity().await.map_err(|err| {
@@ -539,6 +542,25 @@ impl KubernetesComputeDriver {
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
+}
+
+/// Reject any sandbox mode other than SANDBOX_MODE_UNSPECIFIED.
+/// The Kubernetes driver only supports supervised (default) mode.
+fn check_sandbox_mode(sandbox: &Sandbox) -> Result<(), tonic::Status> {
+    let mode = sandbox
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.as_ref())
+        .map(|t| t.mode)
+        .unwrap_or(0);
+    if mode != SandboxMode::Unspecified as i32 {
+        return Err(tonic::Status::failed_precondition(format!(
+            "sandbox mode {} is not supported by the Kubernetes compute driver; \
+             only SANDBOX_MODE_UNSPECIFIED (supervised) is supported",
+            mode
+        )));
+    }
+    Ok(())
 }
 
 fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
@@ -1394,6 +1416,51 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
 mod tests {
     use super::*;
     use prost_types::{Struct, Value, value::Kind};
+
+    #[test]
+    fn check_sandbox_mode_rejects_nested_mode() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    mode: 2, // SANDBOX_MODE_NESTED
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = check_sandbox_mode(&sandbox).unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("not supported by the Kubernetes compute driver")
+        );
+    }
+
+    #[test]
+    fn check_sandbox_mode_accepts_unspecified_mode() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    mode: 0, // SANDBOX_MODE_UNSPECIFIED
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        check_sandbox_mode(&sandbox).expect("mode 0 should be accepted");
+    }
+
+    #[test]
+    fn check_sandbox_mode_accepts_missing_template() {
+        // A sandbox with no spec/template defaults to mode 0 (unspecified).
+        let sandbox = Sandbox::default();
+        check_sandbox_mode(&sandbox).expect("missing template should be treated as mode 0");
+    }
 
     #[test]
     fn apply_required_env_always_injects_ssh_handshake_secret() {

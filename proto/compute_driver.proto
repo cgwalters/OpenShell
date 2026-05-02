@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
+import "openshell.proto";
 
 // Internal compute-driver contract used by the gateway.
 //
@@ -115,6 +116,8 @@ message DriverSandboxTemplate {
   // For the Kubernetes driver this carries fields such as runtimeClassName,
   // annotations, and volumeClaimTemplates.
   google.protobuf.Struct platform_config = 11;
+  // Sandbox execution mode forwarded from the public SandboxTemplate.
+  openshell.v1.SandboxMode mode = 12;
 }
 
 // Typed compute-resource requirements.

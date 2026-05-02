@@ -27,6 +27,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
+use openshell_core::proto::openshell::SandboxMode;
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::HashMap;
 use std::io::Read;
@@ -279,6 +280,16 @@ impl DockerComputeDriver {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support template.platform_config",
             ));
+        }
+
+        // Reject unsupported sandbox modes. Only SANDBOX_MODE_UNSPECIFIED (supervised)
+        // is supported by the Docker driver.
+        if template.mode != SandboxMode::Unspecified as i32 {
+            return Err(Status::failed_precondition(format!(
+                "sandbox mode {} is not supported by the Docker compute driver; \
+                 only SANDBOX_MODE_UNSPECIFIED (supervised) is supported",
+                template.mode
+            )));
         }
 
         let _ = docker_resource_limits(template)?;
