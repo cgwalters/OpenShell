@@ -6,3 +6,7 @@
 ["gateway:docker"]
 description = "Run a standalone gateway with the bundled Docker compute driver"
 run = "bash tasks/scripts/gateway-docker.sh"
+
+["gateway:podman"]
+description = "Run a standalone gateway with the Podman compute driver"
+run = "bash tasks/scripts/gateway-podman.sh"
