@@ -468,6 +468,17 @@ async fn build_compute_runtime(
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string());
 
+            let passthrough = std::env::var("OPENSHELL_PODMAN_PASSTHROUGH")
+                .ok()
+                .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+
+            // Optional host path for a GCP Application Default Credentials JSON
+            // file, bind-mounted read-only into passthrough-mode containers.
+            let adc_host_path = std::env::var("OPENSHELL_PODMAN_ADC_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from);
+
             ComputeRuntime::new_podman(
                 openshell_driver_podman::PodmanComputeConfig {
                     socket_path,
@@ -483,6 +494,8 @@ async fn build_compute_runtime(
                     ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
                     stop_timeout_secs,
                     supervisor_image,
+                    passthrough,
+                    adc_host_path,
                 },
                 store,
                 sandbox_index,

@@ -31,7 +31,7 @@ use tracing::{info, warn};
 use russh::ChannelMsg;
 use russh::client::AuthResult;
 
-use super::provider::is_valid_env_key;
+use super::provider::{is_valid_env_key, resolve_provider_environment};
 use super::validation::{
     level_matches, source_matches, validate_exec_request_fields, validate_policy_safety,
     validate_sandbox_spec,
@@ -72,8 +72,18 @@ pub(super) async fn handle_create_sandbox(
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
     }
 
+    // Resolve provider credentials and merge into spec.environment. Provider
+    // credentials are injected at sandbox creation time so that the compute
+    // driver can pass them through as container environment variables without
+    // any driver-specific provider awareness. Existing spec.environment values
+    // take precedence over provider credentials (callers can override).
+    let provider_env = resolve_provider_environment(&state.store, &spec.providers).await?;
+
     // Ensure the template always carries the resolved image.
     let mut spec = spec;
+    for (key, value) in provider_env {
+        spec.environment.entry(key).or_insert(value);
+    }
     let template = spec.template.get_or_insert_with(SandboxTemplate::default);
     if template.image.is_empty() {
         template.image = state.compute.default_image().to_string();
