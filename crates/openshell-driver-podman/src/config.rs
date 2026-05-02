@@ -102,19 +102,6 @@ pub struct PodmanComputeConfig {
     /// Mounted read-only into sandbox containers at /opt/openshell/bin
     /// using Podman's `type=image` mount.
     pub supervisor_image: String,
-    /// Passthrough mode: skip supervisor injection and inner sandboxing.
-    ///
-    /// When `true`, the driver creates containers using the sandbox image's
-    /// own entrypoint/CMD with no supervisor sideloading, no inner network
-    /// namespace, and no Landlock/seccomp restrictions. The container is
-    /// started with kernel-level permissions required for nested containerization
-    /// (`unmask=/proc/*`, `selinux_opts=disable`, `no_new_privileges=false`).
-    ///
-    /// Use this for development agents (e.g. opencode) running in images that
-    /// already embed the agent binary (e.g. `ghcr.io/bootc-dev/devenv-debian`).
-    /// The security boundary is the outer Podman container; inner-container
-    /// hardening is disabled.
-    pub passthrough: bool,
     /// Host path to an Application Default Credentials JSON file that should be
     /// bind-mounted read-only into passthrough-mode containers.
     ///
@@ -171,7 +158,6 @@ impl Default for PodmanComputeConfig {
             ssh_handshake_skew_secs: DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
             stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
-            passthrough: false,
             adc_host_path: None,
         }
     }
@@ -193,7 +179,6 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("ssh_handshake_skew_secs", &self.ssh_handshake_skew_secs)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
             .field("supervisor_image", &self.supervisor_image)
-            .field("passthrough", &self.passthrough)
             .field("adc_host_path", &self.adc_host_path)
             .finish()
     }

@@ -87,13 +87,6 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: String,
 
-    /// Passthrough mode: skip supervisor injection and inner sandboxing.
-    ///
-    /// When set, containers use the image's own entrypoint with no supervisor
-    /// sideloading, enabling nested containerization (podman-in-podman).
-    #[arg(long, env = "OPENSHELL_PODMAN_PASSTHROUGH", default_value_t = false)]
-    passthrough: bool,
-
     /// Host path to a GCP Application Default Credentials JSON file.
     ///
     /// When set, the file is bind-mounted read-only into passthrough-mode
@@ -130,7 +123,6 @@ async fn main() -> Result<()> {
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         stop_timeout_secs: args.stop_timeout,
         supervisor_image: args.supervisor_image,
-        passthrough: args.passthrough,
         adc_host_path: args.adc_host_path,
     })
     .await

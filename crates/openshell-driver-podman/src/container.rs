@@ -332,7 +332,7 @@ fn build_env_passthrough(
     env.insert("OPENSHELL_SANDBOX_ID".into(), sandbox.id.clone());
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
     // Signal to processes inside that they are running in OpenShell passthrough mode.
-    env.insert("OPENSHELL_PASSTHROUGH".into(), "1".into());
+    env.insert("OPENSHELL_MODE".into(), "nested".into());
 
     env
 }
@@ -396,10 +396,24 @@ fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
     }
 }
 
+/// `SandboxMode::SandboxModeNested` as i32 — nested container / passthrough mode.
+const SANDBOX_MODE_NESTED: i32 = 2;
+
+/// Return `true` when the sandbox template requests nested (passthrough) mode.
+pub(crate) fn is_nested_mode(sandbox: &DriverSandbox) -> bool {
+    let mode = sandbox
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.as_ref())
+        .map(|t| t.mode)
+        .unwrap_or(0);
+    mode == SANDBOX_MODE_NESTED
+}
+
 /// Build the Podman container creation JSON spec.
 #[must_use]
 pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
-    if config.passthrough {
+    if is_nested_mode(sandbox) {
         build_container_spec_passthrough(sandbox, config)
     } else {
         build_container_spec_supervised(sandbox, config)
@@ -1099,10 +1113,17 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_spec_includes_adc_bind_mount_when_configured() {
-        let sandbox = test_sandbox("adc-test-id", "adc-test");
+    fn nested_spec_includes_adc_bind_mount_when_configured() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("adc-test-id", "adc-test");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         let config = PodmanComputeConfig {
-            passthrough: true,
             adc_host_path: Some(std::path::PathBuf::from("/host/adc.json")),
             ..test_config()
         };
@@ -1128,10 +1149,17 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_spec_sets_google_credentials_env_when_adc_configured() {
-        let sandbox = test_sandbox("adc-env-id", "adc-env");
+    fn nested_spec_sets_google_credentials_env_when_adc_configured() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("adc-env-id", "adc-env");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         let config = PodmanComputeConfig {
-            passthrough: true,
             adc_host_path: Some(std::path::PathBuf::from("/host/adc.json")),
             ..test_config()
         };
@@ -1147,10 +1175,17 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_spec_no_adc_mount_when_not_configured() {
-        let sandbox = test_sandbox("no-adc-id", "no-adc");
+    fn nested_spec_no_adc_mount_when_not_configured() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("no-adc-id", "no-adc");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         let config = PodmanComputeConfig {
-            passthrough: true,
             adc_host_path: None,
             ..test_config()
         };
@@ -1172,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_spec_user_env_wins_over_adc_credentials_path() {
+    fn nested_spec_user_env_wins_over_adc_credentials_path() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
         let mut sandbox = test_sandbox("user-env-id", "user-env");
         let mut env_map = std::collections::HashMap::new();
@@ -1184,13 +1219,13 @@ mod tests {
             environment: env_map,
             template: Some(DriverSandboxTemplate {
                 image: "test-image:latest".to_string(),
+                mode: 2, // SANDBOX_MODE_NESTED
                 ..Default::default()
             }),
             ..Default::default()
         });
 
         let config = PodmanComputeConfig {
-            passthrough: true,
             adc_host_path: Some(std::path::PathBuf::from("/host/adc.json")),
             ..test_config()
         };
@@ -1206,12 +1241,17 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_spec_uses_sleep_infinity_to_keep_container_alive() {
-        let sandbox = test_sandbox("sleep-test-id", "sleep-test");
-        let config = PodmanComputeConfig {
-            passthrough: true,
-            ..test_config()
-        };
+    fn nested_spec_uses_sleep_infinity_to_keep_container_alive() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("sleep-test-id", "sleep-test");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
         // Passthrough containers must default to `sleep infinity` so they stay
