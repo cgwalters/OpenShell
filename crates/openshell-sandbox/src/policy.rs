@@ -17,6 +17,10 @@ pub struct SandboxPolicy {
     pub network: NetworkPolicy,
     pub landlock: LandlockPolicy,
     pub process: ProcessPolicy,
+    /// When true, skip all sandbox enforcement (Landlock, seccomp, netns,
+    /// privilege dropping). Set when running in nested mode where the
+    /// container already has elevated capabilities for nested containerization.
+    pub nested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,7 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
             network,
             landlock: proto.landlock.map(LandlockPolicy::from).unwrap_or_default(),
             process: proto.process.map(ProcessPolicy::from).unwrap_or_default(),
+            nested: false,
         })
     }
 }

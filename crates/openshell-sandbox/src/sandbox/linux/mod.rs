@@ -35,7 +35,13 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Prepared
 ///
 /// Calls `restrict_self()` for Landlock and applies seccomp filters.
 /// Neither operation requires root privileges.
+///
+/// When the policy has `nested: true`, all enforcement is skipped — the
+/// container already has elevated capabilities for nested containerization.
 pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
+    if prepared.policy.nested {
+        return Ok(());
+    }
     if let Some(ruleset) = prepared.landlock {
         landlock::enforce(ruleset)?;
     }

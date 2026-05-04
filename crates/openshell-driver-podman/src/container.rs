@@ -290,53 +290,6 @@ fn build_env(
     env
 }
 
-/// Build environment variables for passthrough-mode containers.
-///
-/// Injects only informational and user-supplied vars. No supervisor-specific
-/// vars (`OPENSHELL_SSH_*`, `OPENSHELL_ENDPOINT`) because there is no supervisor.
-fn build_env_passthrough(
-    sandbox: &DriverSandbox,
-    config: &PodmanComputeConfig,
-    image: &str,
-) -> BTreeMap<String, String> {
-    let spec = sandbox.spec.as_ref();
-    let template = spec.and_then(|s| s.template.as_ref());
-
-    let mut env: BTreeMap<String, String> = BTreeMap::new();
-
-    // User-supplied environment.
-    if let Some(s) = spec {
-        if !s.log_level.is_empty() {
-            env.insert("OPENSHELL_LOG_LEVEL".into(), s.log_level.clone());
-        }
-        for (k, v) in &s.environment {
-            env.insert(k.clone(), v.clone());
-        }
-    }
-    if let Some(t) = template {
-        for (k, v) in &t.environment {
-            env.insert(k.clone(), v.clone());
-        }
-    }
-
-    // Inject GOOGLE_APPLICATION_CREDENTIALS pointing at the in-container ADC
-    // mount path. Only set if the user hasn't already provided it, so callers
-    // can still override via spec.environment.
-    if config.adc_host_path.is_some() {
-        env.entry("GOOGLE_APPLICATION_CREDENTIALS".into())
-            .or_insert_with(|| "/run/gcloud/adc.json".into());
-    }
-
-    // Informational vars (cannot be overridden by user).
-    env.insert("OPENSHELL_SANDBOX".into(), sandbox.name.clone());
-    env.insert("OPENSHELL_SANDBOX_ID".into(), sandbox.id.clone());
-    env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
-    // Signal to processes inside that they are running in OpenShell passthrough mode.
-    env.insert("OPENSHELL_MODE".into(), "nested".into());
-
-    env
-}
-
 /// Merge labels from the sandbox template with required managed labels.
 ///
 /// User-supplied labels are inserted first so that the managed labels
@@ -420,12 +373,13 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
     }
 }
 
-/// Build a passthrough container spec: no supervisor injection, no inner sandboxing.
+/// Build a nested container spec: supervisor injected for SSH/exec, but no
+/// inner sandboxing (no Landlock, no seccomp, no netns, no privilege dropping).
 ///
-/// The container uses the image's own ENTRYPOINT/CMD and runs with the kernel
-/// permissions needed for nested containerization (`unmask`, `selinux_opts`,
-/// `no_new_privileges=false`). User-supplied environment variables are passed
-/// through directly — the caller is responsible for injecting API keys etc.
+/// The container runs with the kernel permissions needed for nested
+/// containerization (`unmask`, `selinux_opts`, `no_new_privileges=false`).
+/// The supervisor binary is side-loaded and provides SSH access, but tells
+/// the sandbox runtime to skip all security enforcement via `OPENSHELL_MODE=nested`.
 fn build_container_spec_passthrough(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
@@ -434,7 +388,18 @@ fn build_container_spec_passthrough(
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env_passthrough(sandbox, config, image);
+    // Use the full supervisor env but add OPENSHELL_MODE=nested to signal
+    // the supervisor to skip security enforcement.
+    let mut env = build_env(sandbox, config, image);
+    env.insert("OPENSHELL_MODE".into(), "nested".into());
+
+    // Inject GOOGLE_APPLICATION_CREDENTIALS for ADC support (same logic as
+    // the old passthrough-only build_env_passthrough).
+    if config.adc_host_path.is_some() {
+        env.entry("GOOGLE_APPLICATION_CREDENTIALS".into())
+            .or_insert_with(|| "/run/gcloud/adc.json".into());
+    }
+
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox);
     let devices = build_devices(sandbox);
@@ -442,6 +407,24 @@ fn build_container_spec_passthrough(
     #[allow(clippy::zero_sized_map_values)]
     let mut networks = BTreeMap::new();
     networks.insert(config.network_name.clone(), NetworkAttachment {});
+
+    // Build mounts: ADC bind-mount (if configured) + tmpfs for /run/netns
+    // (needed by the supervisor for network namespace operations).
+    let mut mounts = Vec::new();
+    if let Some(host_path) = &config.adc_host_path {
+        mounts.push(Mount {
+            kind: "bind".into(),
+            source: host_path.to_string_lossy().into_owned(),
+            destination: "/run/gcloud/adc.json".into(),
+            options: vec!["ro".into(), "rbind".into()],
+        });
+    }
+    mounts.push(Mount {
+        kind: "tmpfs".into(),
+        source: "tmpfs".into(),
+        destination: "/run/netns".into(),
+        options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
+    });
 
     let container_spec = ContainerSpec {
         name,
@@ -453,22 +436,21 @@ fn build_container_spec_passthrough(
             dest: "/sandbox".into(),
             options: vec!["rw".into()],
         }],
-        // No supervisor sideload in passthrough mode.
-        image_volumes: vec![],
+        // Side-load the supervisor binary, same as supervised mode.
+        image_volumes: vec![ImageVolume {
+            source: config.supervisor_image.clone(),
+            destination: "/opt/openshell/bin".into(),
+            rw: false,
+        }],
         hostname: format!("sandbox-{}", sandbox.name),
-        // Override the image's ENTRYPOINT to run sleep(1) directly, so the
-        // container stays alive even if the image's CMD (e.g. "bash") would
-        // exit immediately without a TTY. We clear entrypoint so the kernel
-        // exec()s "sleep" directly (no shell wrapper needed), and set command
-        // to ["infinity"] as the sole argument. This matches the behavior of
-        // `podman run --entrypoint sleep <image> infinity`.
-        entrypoint: vec!["sleep".into()],
-        command: vec!["infinity".into()],
+        // Run the supervisor as the entrypoint so SSH/exec are available.
+        entrypoint: vec!["/opt/openshell/bin/openshell-sandbox".into()],
+        command: vec![],
         // Run as root so nested container tools (podman, buildah) have the
         // permissions needed to manage storage, create namespaces, and call
         // newuidmap/newgidmap for rootless inner containers.
         user: "0:0".into(),
-        // Minimal capability drop for passthrough mode. We keep SYS_ADMIN and
+        // Minimal capability drop for nested mode. We keep SYS_ADMIN and
         // NET_ADMIN for nested podman and drop only clearly unnecessary caps.
         cap_drop: vec!["NET_BIND_SERVICE".into(), "NET_RAW".into()],
         cap_add: vec![
@@ -484,17 +466,26 @@ fn build_container_spec_passthrough(
         // its own seccomp filter and use mount/clone/unshare syscalls.
         seccomp_profile_path: "unconfined".into(),
         image_pull_policy: config.image_pull_policy.as_str().to_string(),
-        // Simple liveness check: container process (PID 1) exists.
+        // Health check: supervisor SSH socket or port ready.
         healthconfig: HealthConfig {
-            test: vec!["CMD-SHELL".into(), "test -f /proc/1/status".into()],
-            interval: 10_000_000_000,
-            timeout: 5_000_000_000,
-            retries: 3,
+            test: vec![
+                "CMD-SHELL".into(),
+                format!(
+                    "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
+                    config.sandbox_ssh_socket_path, config.ssh_port
+                ),
+            ],
+            interval: 3_000_000_000,
+            timeout: 2_000_000_000,
+            retries: 10,
             start_period: 5_000_000_000,
         },
         resource_limits,
-        // No SSH handshake secret in passthrough mode (no supervisor).
-        secret_env: BTreeMap::new(),
+        // Inject the SSH handshake secret via Podman's secret_env map.
+        secret_env: BTreeMap::from([(
+            "OPENSHELL_SSH_HANDSHAKE_SECRET".into(),
+            secret_name(&sandbox.id),
+        )]),
         stop_timeout: config.stop_timeout_secs,
         hostadd: vec!["host.containers.internal:host-gateway".into()],
         netns: NetNS {
@@ -512,22 +503,13 @@ fn build_container_spec_passthrough(
             });
             Some(devs)
         },
-        // Bind-mount the host ADC JSON file read-only when configured.
-        // The container path is always /run/gcloud/adc.json, paired with
-        // GOOGLE_APPLICATION_CREDENTIALS set by build_env_passthrough.
-        mounts: config
-            .adc_host_path
-            .as_ref()
-            .map_or_else(Vec::new, |host_path| {
-                vec![Mount {
-                    kind: "bind".into(),
-                    source: host_path.to_string_lossy().into_owned(),
-                    destination: "/run/gcloud/adc.json".into(),
-                    options: vec!["ro".into(), "rbind".into()],
-                }]
-            }),
-        // No SSH port published (no supervisor SSH server).
-        portmappings: vec![],
+        mounts,
+        // Publish the SSH port with host_port=0 to get an ephemeral host port.
+        portmappings: vec![PortMapping {
+            host_port: 0,
+            container_port: config.ssh_port,
+            protocol: "tcp".into(),
+        }],
         // Unmask /proc/* and /sys/fs/cgroup so the inner container runtime
         // can read process info and manage cgroups. Without these, Podman
         // inside the container fails when trying to inspect or create containers.
@@ -1132,14 +1114,17 @@ mod tests {
         let mounts = spec["mounts"]
             .as_array()
             .expect("mounts should be an array");
-        assert_eq!(mounts.len(), 1, "should have exactly one mount for ADC");
+        // ADC bind mount + /run/netns tmpfs
+        assert_eq!(mounts.len(), 2, "should have ADC mount + /run/netns tmpfs");
 
-        let mount = &mounts[0];
-        assert_eq!(mount["type"].as_str(), Some("bind"));
-        assert_eq!(mount["source"].as_str(), Some("/host/adc.json"));
-        assert_eq!(mount["destination"].as_str(), Some("/run/gcloud/adc.json"));
+        let adc_mount = mounts
+            .iter()
+            .find(|m| m["destination"].as_str() == Some("/run/gcloud/adc.json"))
+            .expect("should have ADC mount");
+        assert_eq!(adc_mount["type"].as_str(), Some("bind"));
+        assert_eq!(adc_mount["source"].as_str(), Some("/host/adc.json"));
         let empty = vec![];
-        let has_ro = mount["options"]
+        let has_ro = adc_mount["options"]
             .as_array()
             .unwrap_or(&empty)
             .iter()
@@ -1191,11 +1176,15 @@ mod tests {
         };
         let spec = build_container_spec(&sandbox, &config);
 
-        // mounts is skipped entirely when empty (skip_serializing_if = "Vec::is_empty")
-        let mounts = spec["mounts"].as_array();
-        assert!(
-            mounts.is_none_or(Vec::is_empty),
-            "no mounts without ADC config"
+        // Only the /run/netns tmpfs mount should be present (no ADC).
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert_eq!(mounts.len(), 1, "only /run/netns tmpfs without ADC config");
+        assert_eq!(
+            mounts[0]["destination"].as_str(),
+            Some("/run/netns"),
+            "sole mount should be /run/netns tmpfs"
         );
 
         // GOOGLE_APPLICATION_CREDENTIALS must not be injected either
@@ -1241,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_spec_uses_sleep_infinity_to_keep_container_alive() {
+    fn nested_spec_uses_supervisor_entrypoint() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
         let mut sandbox = test_sandbox("sleep-test-id", "sleep-test");
         sandbox.spec = Some(DriverSandboxSpec {
@@ -1254,9 +1243,7 @@ mod tests {
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
-        // Passthrough containers must default to `sleep infinity` so they stay
-        // alive regardless of the image's CMD (e.g. devenv-debian sets CMD=bash
-        // which exits immediately without a TTY).
+        // Nested containers run the supervisor binary so SSH/exec are available.
         let entrypoint: Vec<&str> = spec["entrypoint"]
             .as_array()
             .expect("entrypoint should be an array")
@@ -1265,20 +1252,126 @@ mod tests {
             .collect();
         assert_eq!(
             entrypoint,
-            vec!["sleep"],
-            "passthrough entrypoint should be sleep"
+            vec!["/opt/openshell/bin/openshell-sandbox"],
+            "nested entrypoint should be the supervisor"
         );
 
-        let command: Vec<&str> = spec["command"]
+        // command should be empty (supervisor handles its own lifecycle).
+        assert!(
+            spec.get("command").is_none()
+                || spec["command"].as_array().is_none_or(|a| a.is_empty()),
+            "nested command should be empty"
+        );
+    }
+
+    #[test]
+    fn nested_spec_includes_supervisor_image_volume() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("nested-vol-id", "nested-vol");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let image_volumes = spec["image_volumes"]
             .as_array()
-            .expect("command should be an array")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
+            .expect("image_volumes should be an array");
         assert_eq!(
-            command,
-            vec!["infinity"],
-            "passthrough command should be infinity"
+            image_volumes.len(),
+            1,
+            "nested mode should have exactly one image volume (supervisor)"
+        );
+        assert_eq!(
+            image_volumes[0]["source"].as_str(),
+            Some("openshell/supervisor:latest"),
+            "image volume source should be the supervisor image"
+        );
+        assert_eq!(
+            image_volumes[0]["destination"].as_str(),
+            Some("/opt/openshell/bin"),
+            "image volume destination should be /opt/openshell/bin"
+        );
+    }
+
+    #[test]
+    fn nested_spec_includes_ssh_secret() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("nested-secret-id", "nested-secret");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let secret_env = spec["secret_env"]
+            .as_object()
+            .expect("secret_env should be an object");
+        assert!(
+            secret_env.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
+            "nested mode should include SSH handshake secret"
+        );
+        assert_eq!(
+            secret_env["OPENSHELL_SSH_HANDSHAKE_SECRET"].as_str(),
+            Some("openshell-handshake-nested-secret-id"),
+        );
+    }
+
+    #[test]
+    fn nested_spec_includes_ssh_port_mapping() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("nested-port-id", "nested-port");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let portmappings = spec["portmappings"]
+            .as_array()
+            .expect("portmappings should be an array");
+        assert_eq!(
+            portmappings.len(),
+            1,
+            "nested mode should publish one port (SSH)"
+        );
+        assert_eq!(
+            portmappings[0]["container_port"].as_u64(),
+            Some(u64::from(config.ssh_port)),
+        );
+    }
+
+    #[test]
+    fn nested_spec_sets_openshell_mode_nested() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox("mode-test-id", "mode-test");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let env = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env.get("OPENSHELL_MODE").and_then(|v| v.as_str()),
+            Some("nested"),
+            "OPENSHELL_MODE should be 'nested' in nested mode"
         );
     }
 }

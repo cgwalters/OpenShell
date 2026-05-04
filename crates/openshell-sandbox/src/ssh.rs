@@ -1483,6 +1483,7 @@ mod tests {
                 run_as_user: None,
                 run_as_group: None,
             },
+            nested: false,
         };
 
         // Skip if running as root: drop_privileges would try to switch to
@@ -1511,6 +1512,7 @@ mod tests {
                         run_as_user: None,
                         run_as_group: None,
                     },
+                    nested: false,
                 },
                 None,
             )

@@ -432,6 +432,12 @@ impl Drop for ProcessHandle {
 #[cfg(unix)]
 #[allow(clippy::similar_names)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
+    // In nested mode, skip privilege dropping entirely — the process needs
+    // to run as root for nested container runtimes.
+    if policy.nested {
+        return Ok(());
+    }
+
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
         _ => None,
@@ -611,6 +617,7 @@ mod tests {
             network: NetworkPolicy::default(),
             landlock: LandlockPolicy::default(),
             process,
+            nested: false,
         }
     }
 

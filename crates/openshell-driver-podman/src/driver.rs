@@ -224,27 +224,26 @@ impl PodmanComputeDriver {
         let is_nested = container::is_nested_mode(sandbox);
 
         if is_nested {
-            // Nested mode: no supervisor sideloading, no SSH handshake secret.
-            // Pull only the sandbox image and create the container directly.
             info!(
                 mode = "nested",
-                "Creating sandbox in nested (passthrough) mode"
+                "Creating sandbox in nested mode (supervisor with no enforcement)"
             );
-        } else {
-            // 1a. Pull the supervisor image if needed. The supervisor binary
-            //     is shipped in a standalone OCI image and mounted into sandbox
-            //     containers via Podman's type=image mount. Using "missing"
-            //     policy so the image is only pulled once and then cached.
-            info!(
-                image = %self.config.supervisor_image,
-                policy = "missing",
-                "Ensuring supervisor image"
-            );
-            self.client
-                .pull_image(&self.config.supervisor_image, "missing")
-                .await
-                .map_err(ComputeDriverError::from)?;
         }
+
+        // 1a. Pull the supervisor image if needed. The supervisor binary
+        //     is shipped in a standalone OCI image and mounted into sandbox
+        //     containers via Podman's type=image mount. Using "missing"
+        //     policy so the image is only pulled once and then cached.
+        //     Needed for both supervised and nested modes.
+        info!(
+            image = %self.config.supervisor_image,
+            policy = "missing",
+            "Ensuring supervisor image"
+        );
+        self.client
+            .pull_image(&self.config.supervisor_image, "missing")
+            .await
+            .map_err(ComputeDriverError::from)?;
 
         // 1b. Pull the sandbox image if needed (Podman does not pull on create).
         let image = container::resolve_image(sandbox, &self.config);
@@ -262,20 +261,17 @@ impl PodmanComputeDriver {
             .await
             .map_err(ComputeDriverError::from)?;
 
-        if !is_nested {
-            // 2. Create the SSH handshake secret via the Podman secrets API
-            //    so it is not exposed in `podman inspect` output.
-            self.client
-                .create_secret(&sec_name, self.config.ssh_handshake_secret.as_bytes())
-                .await
-                .map_err(ComputeDriverError::from)?;
-        }
+        // 2. Create the SSH handshake secret via the Podman secrets API
+        //    so it is not exposed in `podman inspect` output.
+        //    Needed for both supervised and nested modes (supervisor always provides SSH).
+        self.client
+            .create_secret(&sec_name, self.config.ssh_handshake_secret.as_bytes())
+            .await
+            .map_err(ComputeDriverError::from)?;
 
         // 3. Create workspace volume.
         if let Err(e) = self.client.create_volume(&vol_name).await {
-            if !is_nested {
-                let _ = self.client.remove_secret(&sec_name).await;
-            }
+            let _ = self.client.remove_secret(&sec_name).await;
             return Err(ComputeDriverError::from(e));
         }
 
@@ -289,16 +285,12 @@ impl PodmanComputeDriver {
                 // container's ID (which has the same name but a different
                 // ID), so they would be orphaned otherwise.
                 let _ = self.client.remove_volume(&vol_name).await;
-                if !is_nested {
-                    let _ = self.client.remove_secret(&sec_name).await;
-                }
+                let _ = self.client.remove_secret(&sec_name).await;
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
-                if !is_nested {
-                    let _ = self.client.remove_secret(&sec_name).await;
-                }
+                let _ = self.client.remove_secret(&sec_name).await;
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -312,9 +304,7 @@ impl PodmanComputeDriver {
             );
             let _ = self.client.remove_container(&name).await;
             let _ = self.client.remove_volume(&vol_name).await;
-            if !is_nested {
-                let _ = self.client.remove_secret(&sec_name).await;
-            }
+            let _ = self.client.remove_secret(&sec_name).await;
             return Err(ComputeDriverError::from(e));
         }
 

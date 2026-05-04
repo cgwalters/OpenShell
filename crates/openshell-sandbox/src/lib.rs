@@ -93,7 +93,10 @@ use crate::l7::tls::{
     write_ca_files,
 };
 use crate::opa::OpaEngine;
-use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
+use crate::policy::{
+    FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
+    SandboxPolicy,
+};
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
@@ -249,6 +252,10 @@ pub async fn run_sandbox(
         }
     }
 
+    // Detect nested mode: the Podman driver sets OPENSHELL_MODE=nested when
+    // the supervisor should provide SSH/exec but skip all security enforcement.
+    let is_nested = std::env::var("OPENSHELL_MODE").ok().as_deref() == Some("nested");
+
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
@@ -261,10 +268,38 @@ pub async fn run_sandbox(
     )
     .await?;
 
+    // In nested mode, override the policy to disable all enforcement.
+    // The container already has elevated capabilities for nested containerization;
+    // Landlock/seccomp/netns/privilege-dropping would interfere.
+    let policy = if is_nested {
+        info!("Nested mode: supervisor providing SSH/exec without enforcement");
+        SandboxPolicy {
+            nested: true,
+            // Disable enforcement: no filesystem restrictions, allow-all network,
+            // no privilege dropping.
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy {
+                mode: NetworkMode::Allow,
+                proxy: None,
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: None,
+                run_as_group: None,
+            },
+            ..policy
+        }
+    } else {
+        policy
+    };
+
     // Validate that the required "sandbox" user exists in this image.
     // All sandbox images must include this user for privilege dropping.
+    // Skip in nested mode — no privilege dropping occurs.
     #[cfg(unix)]
-    validate_sandbox_user(&policy)?;
+    if !is_nested {
+        validate_sandbox_user(&policy)?;
+    }
 
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
@@ -423,7 +458,11 @@ pub async fn run_sandbox(
     // Install the supervisor seccomp prelude after privileged startup helpers
     // (network namespace setup, iptables probes) complete, but before the SSH
     // listener and workload process are exposed.
-    apply_supervisor_startup_hardening()?;
+    // Skip in nested mode — the container needs full syscall access for nested
+    // container runtimes.
+    if !is_nested {
+        apply_supervisor_startup_hardening()?;
+    }
 
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
@@ -1557,6 +1596,7 @@ mod baseline_tests {
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
+            nested: false,
         };
 
         enrich_sandbox_baseline_paths(&mut policy);
@@ -1688,6 +1728,7 @@ async fn load_policy(
             },
             landlock: config.landlock,
             process: config.process,
+            nested: false,
         };
         enrich_sandbox_baseline_paths(&mut policy);
         return Ok((policy, Some(Arc::new(engine)), None));
@@ -2791,6 +2832,7 @@ filesystem_policy:
                 run_as_user,
                 run_as_group,
             },
+            nested: false,
         }
     }
 
