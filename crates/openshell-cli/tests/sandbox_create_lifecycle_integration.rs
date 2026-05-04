@@ -584,6 +584,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         &HashMap::new(),
         0,
         &tls,
+        &HashMap::new(),
     )
     .await
     .expect("sandbox create should succeed");
@@ -627,6 +628,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         &HashMap::new(),
         0,
         &tls,
+        &HashMap::new(),
     )
     .await
     .expect("sandbox create should succeed");
@@ -673,6 +675,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         &HashMap::new(),
         0,
         &tls,
+        &HashMap::new(),
     )
     .await
     .expect("sandbox create shell should succeed");
@@ -719,6 +722,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         &HashMap::new(),
         0,
         &tls,
+        &HashMap::new(),
     )
     .await
     .expect("sandbox create should succeed");
@@ -769,6 +773,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         &HashMap::new(),
         0,
         &tls,
+        &HashMap::new(),
     )
     .await
     .expect("sandbox create with forward should succeed");

@@ -1306,6 +1306,10 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
+        /// Set environment variables in the sandbox (KEY=VALUE format, repeatable).
+        #[arg(long = "env")]
+        envs: Vec<String>,
+
         /// Sandbox execution mode.
         ///
         /// `nested` grants elevated capabilities for running inner container
@@ -2470,6 +2474,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    envs,
                     mode,
                     command,
                 } => {
@@ -2512,6 +2517,19 @@ async fn main() -> Result<()> {
                             ));
                         }
                         labels_map.insert(parts[0].to_string(), parts[1].to_string());
+                    }
+
+                    // Parse --env flags into a HashMap<String, String>.
+                    let mut env_map = std::collections::HashMap::new();
+                    for env_str in &envs {
+                        let parts: Vec<&str> = env_str.splitn(2, '=').collect();
+                        if parts.len() != 2 {
+                            return Err(miette::miette!(
+                                "invalid env format '{}', expected KEY=VALUE",
+                                env_str
+                            ));
+                        }
+                        env_map.insert(parts[0].to_string(), parts[1].to_string());
                     }
 
                     // Parse --upload spec into (local_path, sandbox_path, git_ignore).
@@ -2580,6 +2598,7 @@ async fn main() -> Result<()> {
                                 &labels_map,
                                 sandbox_mode,
                                 &tls,
+                                &env_map,
                             ))
                             .await?;
                         }
@@ -2603,6 +2622,8 @@ async fn main() -> Result<()> {
                                 bootstrap_override,
                                 auto_providers_override,
                                 sandbox_mode,
+                                &labels_map,
+                                &env_map,
                             ))
                             .await?;
                         }
