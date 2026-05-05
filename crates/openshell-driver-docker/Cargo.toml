@@ -21,6 +21,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 bollard = { version = "0.20" }
+serde_json = { workspace = true }
 tar = "0.4"
 tempfile = "3"
 

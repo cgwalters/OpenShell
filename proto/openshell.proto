@@ -194,6 +194,11 @@ message Sandbox {
 message SandboxSpec {
   // Log level exposed to processes running inside the sandbox.
   string log_level = 1;
+  // Commands to run sequentially before the main workload. Each runs under
+  // the sandbox's configured security policy (Landlock, seccomp, netns,
+  // drop_privileges). If any command exits non-zero the sandbox transitions
+  // to an error state and the workload is not started.
+  repeated InitCommand init_commands = 2;
   // Environment variables injected into the sandbox runtime.
   map<string, string> environment = 5;
   // Container or VM template used to provision the sandbox.
@@ -208,6 +213,15 @@ message SandboxSpec {
   // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
   // first available GPU.
   string gpu_device = 10;
+}
+
+// A single command to execute before the sandbox workload starts.
+// Commands run sequentially; execution stops on the first non-zero exit.
+message InitCommand {
+  // Command argv to execute via exec (not a shell string). For example:
+  // ["git", "clone", "--depth", "1", "https://github.com/user/dots", "/tmp/df"]
+  // This avoids /bin/sh dependencies on minimal images.
+  repeated string argv = 1;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

@@ -875,6 +875,19 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         "OPENSHELL_SANDBOX_COMMAND".to_string(),
         SANDBOX_COMMAND.to_string(),
     );
+
+    // Inject init commands for the supervisor. The supervisor reads
+    // OPENSHELL_INIT_COMMANDS and runs each argv sequentially before the workload.
+    if let Some(spec) = sandbox.spec.as_ref() {
+        let cmds: Vec<Vec<String>> = spec.init_commands.iter().map(|c| c.argv.clone()).collect();
+        if !cmds.is_empty() {
+            // Vec<Vec<String>> is always serializable.
+            let json = serde_json::to_string(&cmds)
+                .unwrap_or_else(|e| unreachable!("init_commands serialization failed: {e}"));
+            environment.insert("OPENSHELL_INIT_COMMANDS".to_string(), json);
+        }
+    }
+
     if config.guest_tls.is_some() {
         environment.insert(
             "OPENSHELL_TLS_CA".to_string(),

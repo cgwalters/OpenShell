@@ -1108,6 +1108,7 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
             .map(driver_sandbox_template_from_public),
         gpu: spec.gpu,
         gpu_device: spec.gpu_device.clone(),
+        init_commands: spec.init_commands.clone(),
     }
 }
 

@@ -81,6 +81,10 @@ message DriverSandbox {
 message DriverSandboxSpec {
   // Log level exposed to processes running inside the sandbox.
   string log_level = 1;
+  // Sequential commands to run inside the sandbox before the main workload.
+  // The supervisor reads OPENSHELL_INIT_COMMANDS (JSON-encoded) and runs
+  // each argv in order, stopping on the first non-zero exit.
+  repeated openshell.v1.InitCommand init_commands = 2;
   // Environment variables injected into the sandbox runtime.
   map<string, string> environment = 5;
   // Runtime template consumed by the driver during provisioning.

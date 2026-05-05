@@ -27,11 +27,12 @@ use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, InitCommand,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope, SettingValue,
+    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -2134,6 +2135,7 @@ pub async fn sandbox_create_with_bootstrap(
     sandbox_mode: i32,
     labels: &HashMap<String, String>,
     environment: &HashMap<String, String>,
+    init_commands: &[Vec<String>],
 ) -> Result<()> {
     if !crate::bootstrap::confirm_bootstrap(bootstrap_override)? {
         return Err(miette::miette!(
@@ -2174,6 +2176,7 @@ pub async fn sandbox_create_with_bootstrap(
         sandbox_mode,
         &tls,
         environment,
+        init_commands,
     ))
     .await
 }
@@ -2233,6 +2236,7 @@ pub async fn sandbox_create(
     sandbox_mode: i32,
     tls: &TlsOptions,
     environment: &HashMap<String, String>,
+    init_commands: &[Vec<String>],
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
         return Err(miette::miette!(
@@ -2338,6 +2342,10 @@ pub async fn sandbox_create(
             providers: configured_providers,
             template,
             environment: environment.clone(),
+            init_commands: init_commands
+                .iter()
+                .map(|argv| InitCommand { argv: argv.clone() })
+                .collect(),
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),

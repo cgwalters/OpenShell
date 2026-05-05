@@ -1310,6 +1310,18 @@ enum SandboxCommands {
         #[arg(long = "env")]
         envs: Vec<String>,
 
+        /// Command to run before the main workload (repeatable).
+        ///
+        /// Each value is parsed as POSIX shell words (quoting and escaping
+        /// are honoured) and exec'd directly — no shell is invoked. Example:
+        ///
+        ///   --init-command "git clone --depth 1 https://github.com/user/dots /tmp/df"
+        ///   --init-command "cp -a /tmp/df/. ~/"
+        ///
+        /// Commands run sequentially; a non-zero exit aborts sandbox startup.
+        #[arg(long = "init-command", value_name = "CMD")]
+        init_commands: Vec<String>,
+
         /// Sandbox execution mode.
         ///
         /// `nested` grants elevated capabilities for running inner container
@@ -2475,6 +2487,7 @@ async fn main() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
+                    init_commands,
                     mode,
                     command,
                 } => {
@@ -2531,6 +2544,27 @@ async fn main() -> Result<()> {
                         }
                         env_map.insert(parts[0].to_string(), parts[1].to_string());
                     }
+
+                    // Parse each --init-command string as POSIX shell words so
+                    // that quoting and escaping are honoured (e.g. arguments
+                    // containing spaces). The argv is exec'd directly — no shell.
+                    let init_commands_parsed = init_commands
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            let argv = shell_words::split(s).map_err(|e| {
+                                miette::miette!(
+                                    "--init-command[{i}] contains invalid shell quoting: {e}"
+                                )
+                            })?;
+                            if argv.is_empty() {
+                                return Err(miette::miette!(
+                                    "--init-command[{i}] is empty; provide at least one token"
+                                ));
+                            }
+                            Ok(argv)
+                        })
+                        .collect::<Result<Vec<Vec<String>>>>()?;
 
                     // Parse --upload spec into (local_path, sandbox_path, git_ignore).
                     let upload_spec = upload.as_deref().map(|s| {
@@ -2599,6 +2633,7 @@ async fn main() -> Result<()> {
                                 sandbox_mode,
                                 &tls,
                                 &env_map,
+                                &init_commands_parsed,
                             ))
                             .await?;
                         }
@@ -2624,6 +2659,7 @@ async fn main() -> Result<()> {
                                 sandbox_mode,
                                 &labels_map,
                                 &env_map,
+                                &init_commands_parsed,
                             ))
                             .await?;
                         }
@@ -3617,6 +3653,44 @@ mod tests {
             }) = cli.command
             {
                 assert_eq!(name.as_deref(), Some("my-sb"));
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
+        }
+    }
+
+    /// Verify that `--init-command` is accepted as a repeatable flag and
+    /// that each value is captured as a separate entry.
+    #[test]
+    fn sandbox_create_init_command_is_repeatable() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--init-command",
+            "git clone https://github.com/user/dots /tmp/df",
+            "--init-command",
+            "/bin/sh -c 'echo hello'",
+            "--",
+            "bash",
+        ]);
+        assert!(
+            result.is_ok(),
+            "sandbox create --init-command should parse: {:?}",
+            result.err()
+        );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { init_commands, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(init_commands.len(), 2);
+                assert_eq!(
+                    init_commands[0],
+                    "git clone https://github.com/user/dots /tmp/df"
+                );
+                assert_eq!(init_commands[1], "/bin/sh -c 'echo hello'");
             } else {
                 panic!("expected SandboxCommands::Create");
             }

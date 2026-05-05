@@ -256,6 +256,19 @@ pub async fn run_sandbox(
     // the supervisor should provide SSH/exec but skip all security enforcement.
     let is_nested = std::env::var("OPENSHELL_MODE").ok().as_deref() == Some("nested");
 
+    // Parse init commands from JSON-encoded env var injected by the driver.
+    // Format: [["git", "clone", "..."], ["/usr/bin/env", "bash", "-c", "..."]]
+    // Malformed JSON is logged and treated as no init commands (safe default).
+    let init_commands: Vec<Vec<String>> = std::env::var("OPENSHELL_INIT_COMMANDS").map_or_else(
+        |_| vec![],
+        |s| {
+            serde_json::from_str(&s).unwrap_or_else(|e| {
+                warn!("Failed to parse OPENSHELL_INIT_COMMANDS, skipping init commands: {e}");
+                vec![]
+            })
+        },
+    );
+
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
@@ -726,6 +739,30 @@ pub async fn run_sandbox(
     ) {
         supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone());
         info!("supervisor session task spawned");
+    }
+
+    // Run init commands sequentially before the main workload.
+    // Each runs under the same policy enforcement as the workload.
+    // Failure here aborts sandbox startup — the workload is never spawned.
+    #[cfg(target_os = "linux")]
+    if !init_commands.is_empty() {
+        info!(
+            "Running {} init command(s) before workload",
+            init_commands.len()
+        );
+        process::run_init_commands(
+            &init_commands,
+            workdir.as_deref(),
+            &policy,
+            netns.as_ref().and_then(NetworkNamespace::ns_fd),
+            ca_file_paths.as_ref(),
+            &provider_env,
+            // timeout_secs is applied per-command, not as a total budget.
+            // With N init commands each gets the full timeout independently.
+            Duration::from_secs(timeout_secs),
+        )
+        .await?;
+        info!("All init commands completed successfully");
     }
 
     #[cfg(target_os = "linux")]

@@ -953,6 +953,7 @@ fn sandbox_to_k8s_spec(
                     client_tls_secret_name,
                     host_gateway_ip,
                     inject_workspace,
+                    &spec.init_commands,
                 ),
             );
             if !template.agent_socket_path.is_empty() {
@@ -999,6 +1000,7 @@ fn sandbox_to_k8s_spec(
                 client_tls_secret_name,
                 host_gateway_ip,
                 inject_workspace,
+                spec.as_ref().map_or(&[], |s| s.init_commands.as_slice()),
             ),
         );
     }
@@ -1024,6 +1026,7 @@ fn sandbox_template_to_k8s(
     client_tls_secret_name: &str,
     host_gateway_ip: &str,
     inject_workspace: bool,
+    init_commands: &[openshell_core::proto::openshell::InitCommand],
 ) -> serde_json::Value {
     // The supervisor binary is always side-loaded from the node filesystem
     // via a hostPath volume, regardless of which sandbox image is used.
@@ -1074,6 +1077,7 @@ fn sandbox_template_to_k8s(
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
         !client_tls_secret_name.is_empty(),
+        init_commands,
     );
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
@@ -1221,6 +1225,7 @@ fn build_env_list(
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
+    init_commands: &[openshell_core::proto::openshell::InitCommand],
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
     apply_env_map(&mut env, template_environment);
@@ -1235,6 +1240,15 @@ fn build_env_list(
         ssh_handshake_skew_secs,
         tls_enabled,
     );
+    // Inject init commands for the supervisor. The supervisor reads
+    // OPENSHELL_INIT_COMMANDS and runs each argv sequentially before the workload.
+    let init_cmds: Vec<Vec<String>> = init_commands.iter().map(|c| c.argv.clone()).collect();
+    if !init_cmds.is_empty() {
+        // Vec<Vec<String>> is always serializable.
+        let json = serde_json::to_string(&init_cmds)
+            .unwrap_or_else(|e| unreachable!("init_commands serialization failed: {e}"));
+        upsert_env(&mut env, "OPENSHELL_INIT_COMMANDS", &json);
+    }
     env
 }
 
@@ -1649,6 +1663,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         assert_eq!(
@@ -1691,6 +1706,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         assert_eq!(
@@ -1729,6 +1745,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         assert_eq!(
@@ -1763,6 +1780,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
@@ -1790,6 +1808,7 @@ mod tests {
             "",
             "172.17.0.1",
             true,
+            &[],
         );
 
         let host_aliases = pod_template["spec"]["hostAliases"]
@@ -1821,6 +1840,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         assert!(
@@ -1847,6 +1867,7 @@ mod tests {
             "my-tls-secret",
             "",
             true,
+            &[],
         );
 
         let volumes = pod_template["spec"]["volumes"]
@@ -1990,6 +2011,7 @@ mod tests {
             "",
             "",
             false, // user provided custom VCTs
+            &[],
         );
 
         // No init container should be present

@@ -20,7 +20,7 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
-use tracing::debug;
+use tracing::{debug, info};
 
 const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
 
@@ -74,6 +74,136 @@ pub fn harden_child_process() -> Result<()> {
                 std::io::Error::last_os_error()
             ));
         }
+    }
+
+    Ok(())
+}
+
+/// Build a `pre_exec` closure for a child process.
+///
+/// This applies the full security enforcement in the child after fork:
+///   1. Create new process group (always, including for interactive main workload).
+///   2. Enter network namespace.
+///   3. Drop privileges.
+///   4. Harden (rlimits, etc.).
+///   5. Enforce Landlock + seccomp.
+///
+/// `prepared_sandbox` is consumed on first call (`pre_exec` is called exactly once).
+/// A fresh `PreparedSandbox` must be created for each call to this function because
+/// Landlock's `restrict_self()` consumes the prepared file descriptors.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub fn build_pre_exec(
+    policy: SandboxPolicy,
+    netns_fd: Option<RawFd>,
+    prepared_sandbox: sandbox::linux::PreparedSandbox,
+) -> impl FnMut() -> std::io::Result<()> + Send + 'static {
+    let mut prepared = Some(prepared_sandbox);
+    move || {
+        // Always create a new process group — init commands must never inherit
+        // the parent's process group, and main workload setpgid is fine for
+        // non-interactive use (interactive mode is handled at a higher level).
+        // SAFETY: setpgid is async-signal-safe; called after fork, before exec.
+        unsafe { libc::setpgid(0, 0) };
+
+        // Enter network namespace before applying other restrictions.
+        if let Some(fd) = netns_fd {
+            // SAFETY: setns is async-signal-safe; fd is a valid netns file descriptor.
+            let result = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        if let Some(p) = prepared.take() {
+            sandbox::linux::enforce(p).map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Run init commands sequentially before the main workload.
+///
+/// Each command is exec'd directly (no shell). A fresh `PreparedSandbox`
+/// is created for each command because Landlock's `restrict_self()` consumes
+/// the prepared fds on first call.
+///
+/// Returns `Ok(())` if all commands succeed, or `Err` on the first failure.
+/// On failure the main workload must not be started.
+#[cfg(target_os = "linux")]
+pub async fn run_init_commands(
+    commands: &[Vec<String>],
+    workdir: Option<&str>,
+    policy: &SandboxPolicy,
+    netns_fd: Option<RawFd>,
+    ca_paths: Option<&(PathBuf, PathBuf)>,
+    provider_env: &HashMap<String, String>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    for (i, argv) in commands.iter().enumerate() {
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| miette::miette!("init_command[{i}] has empty argv"))?;
+
+        info!("Running init command [{i}]: {argv:?}");
+
+        // Phase 1 (as root): prepare Landlock fds before dropping privileges.
+        let prepared_sandbox = sandbox::linux::prepare(policy, workdir).map_err(|err| {
+            miette::miette!("Failed to prepare sandbox for init command [{i}]: {err}")
+        })?;
+
+        let pre_exec_fn = build_pre_exec(policy.clone(), netns_fd, prepared_sandbox);
+
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .env("OPENSHELL_SANDBOX", "1");
+
+        scrub_sensitive_env(&mut cmd);
+        inject_provider_env(&mut cmd, provider_env);
+
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        }
+
+        if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
+            for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
+                cmd.env(key, value);
+            }
+        }
+
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(pre_exec_fn);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| miette::miette!("Failed to spawn init command [{i}]: {err}"))?;
+
+        let status = tokio::time::timeout(timeout, child.wait())
+            .await
+            .map_err(|_| {
+                miette::miette!("init command [{i}] timed out after {}s", timeout.as_secs())
+            })?
+            .map_err(|err| miette::miette!("init command [{i}] wait failed: {err}"))?;
+
+        if !status.success() {
+            let code = status.code().unwrap_or(-1);
+            return Err(miette::miette!(
+                "init command [{i}] failed with exit code {code}: {argv:?}"
+            ));
+        }
+
+        info!("init command [{i}] completed successfully");
     }
 
     Ok(())
@@ -147,7 +277,10 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
-        interactive: bool,
+        // `interactive` is no longer used in the Linux path; build_pre_exec
+        // always creates a new process group (safe for both interactive and
+        // non-interactive shells in sandbox mode).
+        _interactive: bool,
         policy: &SandboxPolicy,
         netns_fd: Option<RawFd>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
@@ -212,52 +345,15 @@ impl ProcessHandle {
         let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
 
-        // Set up process group for signal handling (non-interactive mode only).
-        // In interactive mode, we inherit the parent's process group to maintain
-        // proper terminal control for shells and interactive programs.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
-        // setpgid and setns are async-signal-safe and safe to call in this context.
+        // setpgid, setns, setuid/setgid, and seccomp are async-signal-safe
+        // and safe to call in this context.
+        #[cfg(target_os = "linux")]
         {
-            let policy = policy.clone();
-            // Wrap in Option so we can .take() it out of the FnMut closure.
-            // pre_exec is only called once (after fork, before exec).
-            #[cfg(target_os = "linux")]
-            let mut prepared_sandbox = Some(prepared_sandbox);
+            let pre_exec_fn = build_pre_exec(policy.clone(), netns_fd, prepared_sandbox);
             #[allow(unsafe_code)]
             unsafe {
-                cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
-                    }
-
-                    // Enter network namespace before applying other restrictions
-                    if let Some(fd) = netns_fd {
-                        let result = libc::setns(fd, libc::CLONE_NEWNET);
-                        if result != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-
-                    // Drop privileges. initgroups/setgid/setuid need access to
-                    // /etc/group and /etc/passwd which would be blocked if
-                    // Landlock were already enforced.
-                    drop_privileges(&policy)
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
-
-                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
-
-                    // Phase 2 (as unprivileged user): Enforce the prepared
-                    // Landlock ruleset via restrict_self() + apply seccomp.
-                    // restrict_self() does not require root.
-                    #[cfg(target_os = "linux")]
-                    if let Some(prepared) = prepared_sandbox.take() {
-                        sandbox::linux::enforce(prepared)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
-                    }
-
-                    Ok(())
-                });
+                cmd.pre_exec(pre_exec_fn);
             }
         }
 
@@ -839,5 +935,123 @@ mod tests {
         let output = cmd.output().await.expect("spawn env");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod init_cmd_tests {
+    use super::*;
+    use crate::policy::{
+        FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
+    };
+    use std::time::Duration;
+
+    fn default_policy() -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+            nested: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_init_commands_empty_succeeds() {
+        let result = run_init_commands(
+            &[],
+            None,
+            &default_policy(),
+            None,
+            None,
+            &HashMap::new(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "empty init commands should succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_init_commands_success() {
+        let cmds = vec![vec!["true".to_string()]];
+        let result = run_init_commands(
+            &cmds,
+            None,
+            &default_policy(),
+            None,
+            None,
+            &HashMap::new(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "successful command should return Ok: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_init_commands_fail_fast() {
+        let cmds = vec![
+            vec!["false".to_string()],
+            vec!["true".to_string()], // should never run
+        ];
+        let result = run_init_commands(
+            &cmds,
+            None,
+            &default_policy(),
+            None,
+            None,
+            &HashMap::new(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(result.is_err(), "failed command should return Err");
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("exit code 1") || msg.contains("failed"),
+            "error should mention failure: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_init_commands_timeout() {
+        let cmds = vec![vec!["sleep".to_string(), "60".to_string()]];
+        let result = run_init_commands(
+            &cmds,
+            None,
+            &default_policy(),
+            None,
+            None,
+            &HashMap::new(),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(result.is_err(), "timed-out command should return Err");
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("timed out"),
+            "error should mention timeout: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_init_commands_empty_argv_errors() {
+        let cmds = vec![vec![]]; // empty argv
+        let result = run_init_commands(
+            &cmds,
+            None,
+            &default_policy(),
+            None,
+            None,
+            &HashMap::new(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(result.is_err(), "empty argv should return Err");
     }
 }

@@ -20,6 +20,7 @@ fn test_sandbox() -> DriverSandbox {
         namespace: String::new(),
         spec: Some(DriverSandboxSpec {
             log_level: "debug".to_string(),
+            init_commands: vec![],
             environment: HashMap::from([("SPEC_ENV".to_string(), "spec".to_string())]),
             template: Some(DriverSandboxTemplate {
                 image: "ghcr.io/nvidia/openshell/sandbox:dev".to_string(),
