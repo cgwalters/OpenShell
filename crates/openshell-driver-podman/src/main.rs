@@ -98,6 +98,14 @@ struct Args {
     /// Host path to the client private key for sandbox mTLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
     podman_tls_key: Option<PathBuf>,
+
+    /// Host path to Application Default Credentials JSON file.
+    ///
+    /// When set, the file is bind-mounted read-only into passthrough-mode
+    /// containers at `/run/gcloud/adc.json` and `GOOGLE_APPLICATION_CREDENTIALS`
+    /// is set to that path automatically.
+    #[arg(long, env = "OPENSHELL_PODMAN_ADC_PATH")]
+    adc_host_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -129,6 +137,8 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.podman_tls_ca,
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
+        adc_host_path: args.adc_host_path,
+        host_dns_servers: Vec::new(),
     })
     .await
     .into_diagnostic()?;

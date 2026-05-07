@@ -530,6 +530,25 @@ impl PodmanClient {
         .await
     }
 
+    /// Create an internal bridge network with DNS enabled. Idempotent.
+    ///
+    /// Internal networks are isolated from the host and only reachable by
+    /// containers attached to them. Used for sidecar proxy architectures
+    /// where agent containers communicate through a proxy on a private network.
+    pub async fn ensure_internal_network(&self, name: &str) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        self.create_ignore_conflict(
+            "/libpod/networks/create",
+            &serde_json::json!({
+                "name": name,
+                "driver": "bridge",
+                "internal": true,
+                "dns_enabled": true,
+            }),
+        )
+        .await
+    }
+
     /// Inspect a network and return the gateway IP of its first subnet.
     ///
     /// The gateway IP is the host's address on the bridge network, used by
@@ -548,6 +567,89 @@ impl PodmanClient {
             .and_then(|g| g.as_str())
             .map(String::from);
         Ok(gateway)
+    }
+
+    /// Inspect a network and return the /24 subnet base for fixed IP derivation.
+    ///
+    /// Given a network whose first subnet is e.g. `"10.89.5.0/24"`, this returns
+    /// `"10.89.5"` so callers can derive static IPs like `"10.89.5.100"`.
+    pub async fn network_subnet_base(&self, name: &str) -> Result<String, PodmanApiError> {
+        validate_name(name)?;
+        let encoded = url_encode(name);
+        let path = format!("/libpod/networks/{encoded}/json");
+        let resp: Value = self.request_json(hyper::Method::GET, &path, None).await?;
+
+        let subnet_str = resp
+            .get("subnets")
+            .and_then(|s| s.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|sub| sub.get("subnet"))
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| {
+                PodmanApiError::Api {
+                    status: 500,
+                    message: format!("network {name:?} has no subnet"),
+                }
+            })?;
+
+        parse_subnet_base(subnet_str).ok_or_else(|| PodmanApiError::Api {
+            status: 500,
+            message: format!("failed to parse subnet base from {subnet_str:?}"),
+        })
+    }
+
+    /// Inspect a container and return its IP on a specific network.
+    ///
+    /// Returns `None` if the container is not attached to the given network
+    /// or if the IP address is empty (e.g. the container hasn't started yet).
+    pub async fn container_ip(
+        &self,
+        container: &str,
+        network: &str,
+    ) -> Result<Option<String>, PodmanApiError> {
+        validate_name(container)?;
+        let inspect = self.inspect_container(container).await?;
+        let ip = inspect
+            .network_settings
+            .networks
+            .get(network)
+            .map(|info| &info.ip_address)
+            .filter(|ip| !ip.is_empty())
+            .cloned();
+        Ok(ip)
+    }
+
+    /// Connect a running container to an additional network.
+    pub async fn network_connect(
+        &self,
+        network: &str,
+        container: &str,
+    ) -> Result<(), PodmanApiError> {
+        validate_name(network)?;
+        validate_name(container)?;
+        let encoded = url_encode(network);
+        self.request_ok(
+            hyper::Method::POST,
+            &format!("/libpod/networks/{encoded}/connect"),
+            Some(&serde_json::json!({"container": container})),
+        )
+        .await
+    }
+
+    /// Remove a network. Idempotent (not-found is ignored).
+    pub async fn remove_network(&self, name: &str) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        match self
+            .request_ok(
+                hyper::Method::DELETE,
+                &format!("/libpod/networks/{name}"),
+                None,
+            )
+            .await
+        {
+            Ok(()) | Err(PodmanApiError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     // ── Secret operations ────────────────────────────────────────────────
@@ -794,6 +896,16 @@ fn error_from_response(status: u16, bytes: &Bytes) -> PodmanApiError {
     }
 }
 
+/// Extract the /24 subnet base from a CIDR string (e.g. `"10.89.5.0/24"` → `"10.89.5"`).
+///
+/// Returns `None` if the address portion is not a valid IPv4 address.
+fn parse_subnet_base(subnet: &str) -> Option<String> {
+    let addr_str = subnet.split('/').next()?;
+    let ip: std::net::Ipv4Addr = addr_str.parse().ok()?;
+    let octets = ip.octets();
+    Some(format!("{}.{}.{}", octets[0], octets[1], octets[2]))
+}
+
 /// Minimal percent-encoding for query parameter values.
 ///
 /// Note: `percent-encoding` is available as a transitive dependency but is not
@@ -840,6 +952,37 @@ mod tests {
         assert!(validate_name("has space").is_err()); // space
         assert!(validate_name("has%20encoded").is_err()); // percent
         assert!(validate_name("has?query").is_err()); // query char
+    }
+
+    #[test]
+    fn parse_subnet_base_extracts_first_three_octets() {
+        assert_eq!(
+            parse_subnet_base("10.89.5.0/24"),
+            Some("10.89.5".to_string())
+        );
+        assert_eq!(
+            parse_subnet_base("172.16.0.0/16"),
+            Some("172.16.0".to_string())
+        );
+        assert_eq!(
+            parse_subnet_base("192.168.1.0/24"),
+            Some("192.168.1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_subnet_base_handles_no_cidr_suffix() {
+        assert_eq!(
+            parse_subnet_base("10.89.5.0"),
+            Some("10.89.5".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_subnet_base_returns_none_for_invalid_input() {
+        assert_eq!(parse_subnet_base("10.89"), None);
+        assert_eq!(parse_subnet_base("10"), None);
+        assert_eq!(parse_subnet_base(""), None);
     }
 
     #[test]

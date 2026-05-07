@@ -1133,6 +1133,7 @@ fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSand
         environment: template.environment.clone(),
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
+        mode: 0,
     }
 }
 

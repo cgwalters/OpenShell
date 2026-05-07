@@ -111,6 +111,22 @@ pub struct PodmanComputeConfig {
     pub guest_tls_cert: Option<PathBuf>,
     /// Host path to the client private key for sandbox mTLS.
     pub guest_tls_key: Option<PathBuf>,
+    /// Host path to Application Default Credentials JSON file.
+    ///
+    /// When `Some`, the file is mounted at `/run/gcloud/adc.json` inside the
+    /// container and `GOOGLE_APPLICATION_CREDENTIALS` is set to that path
+    /// automatically. Only used in passthrough mode; ignored in supervised mode.
+    ///
+    /// Typically set from `OPENSHELL_PODMAN_ADC_PATH` (e.g.
+    /// `~/.config/gcloud/application_default_credentials.json`).
+    pub adc_host_path: Option<PathBuf>,
+    /// Host DNS servers to inject into the proxy sidecar container.
+    ///
+    /// When non-empty, these DNS servers are passed to the proxy container so
+    /// it can resolve external hostnames even on hosts where Podman's default
+    /// DNS is not sufficient (e.g. systemd-resolved setups). Populated from
+    /// `/run/systemd/resolve/resolv.conf` or similar host discovery in future.
+    pub host_dns_servers: Vec<String>,
 }
 
 impl PodmanComputeConfig {
@@ -199,8 +215,51 @@ impl Default for PodmanComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            adc_host_path: None,
+            host_dns_servers: Vec::new(),
         }
     }
+}
+
+/// Parse nameserver entries from resolv.conf content, filtering unreachable addresses.
+fn parse_resolv_conf(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with("nameserver") {
+                line.split_whitespace().nth(1).map(String::from)
+            } else {
+                None
+            }
+        })
+        .filter(|ip| {
+            !ip.starts_with("127.")
+                && !ip.starts_with("169.254.")
+                && !ip.starts_with("::1")
+                && !ip.starts_with("fe80:")
+        })
+        .collect()
+}
+
+/// Discover host DNS resolvers for proxy containers.
+///
+/// Reads nameserver entries from `/run/systemd/resolve/resolv.conf` first
+/// (systemd-resolved's upstream resolvers), falling back to `/etc/resolv.conf`.
+/// Filters out loopback (`127.x`), link-local (`169.254.x`, `fe80:`), and
+/// IPv6 loopback (`::1`) addresses since they're not reachable from inside
+/// a container's network namespace.
+#[must_use]
+pub fn discover_host_dns_servers() -> Vec<String> {
+    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let servers = parse_resolv_conf(&content);
+            if !servers.is_empty() {
+                return servers;
+            }
+        }
+    }
+    Vec::new()
 }
 
 impl std::fmt::Debug for PodmanComputeConfig {
@@ -221,6 +280,8 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_ca", &self.guest_tls_ca)
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
+            .field("adc_host_path", &self.adc_host_path)
+            .field("host_dns_servers", &self.host_dns_servers)
             .finish()
     }
 }
@@ -387,5 +448,43 @@ mod tests {
         assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
         assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
         assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+    }
+
+    // ── DNS resolver parsing ──────────────────────────────────────────
+
+    #[test]
+    fn parse_resolv_conf_extracts_nameservers() {
+        let content = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
+        assert_eq!(parse_resolv_conf(content), vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    #[test]
+    fn parse_resolv_conf_filters_loopback_and_link_local() {
+        let content = "\
+nameserver 8.8.8.8
+nameserver 127.0.0.53
+nameserver 1.1.1.1
+nameserver fe80::1%lo
+nameserver ::1
+nameserver 169.254.169.254
+";
+        assert_eq!(parse_resolv_conf(content), vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    #[test]
+    fn parse_resolv_conf_ignores_comments_and_other_directives() {
+        let content = "\
+# This is a comment
+search example.com
+nameserver 9.9.9.9
+options ndots:5
+";
+        assert_eq!(parse_resolv_conf(content), vec!["9.9.9.9"]);
+    }
+
+    #[test]
+    fn parse_resolv_conf_empty_returns_empty() {
+        assert!(parse_resolv_conf("").is_empty());
+        assert!(parse_resolv_conf("# only comments\nsearch foo.local\n").is_empty());
     }
 }

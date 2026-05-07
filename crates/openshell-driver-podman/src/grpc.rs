@@ -346,16 +346,32 @@ mod tests {
     async fn delete_sandbox_forwards_request_sandbox_id_to_driver_cleanup() {
         let sandbox_id = "sandbox-abc";
         let sandbox_name = "demo";
-        let container_name = container::container_name(sandbox_name);
-        let volume_name = container::volume_name(sandbox_id);
+        let agent_name = container::container_name(sandbox_name);
+        let proxy_name = container::proxy_container_name(sandbox_name);
+        let tls_vol_name = container::tls_volume_name(sandbox_id);
+        let workspace_vol_name = container::volume_name(sandbox_id);
         let secret_name = container::secret_name(sandbox_id);
+        let internal_net = container::internal_network_name(sandbox_id);
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "forward-id",
             vec![
+                // 1. inspect agent → not found
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 2. stop agent → not found
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 3. remove agent → not found
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 4. stop proxy → not found
+                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 5. remove proxy → not found
+                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 6. remove TLS volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 7. remove workspace volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 8. remove secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 9. remove network
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -386,27 +402,45 @@ mod tests {
             vec![
                 format!(
                     "GET {}",
-                    api_path(&format!("/libpod/containers/{container_name}/json"))
+                    api_path(&format!("/libpod/containers/{agent_name}/json"))
                 ),
                 format!(
                     "POST {}",
                     api_path(&format!(
-                        "/libpod/containers/{container_name}/stop?timeout=10"
+                        "/libpod/containers/{agent_name}/stop?timeout=10"
                     ))
                 ),
                 format!(
                     "DELETE {}",
                     api_path(&format!(
-                        "/libpod/containers/{container_name}?force=true&v=true"
+                        "/libpod/containers/{agent_name}?force=true&v=true"
+                    ))
+                ),
+                format!(
+                    "POST {}",
+                    api_path(&format!("/libpod/containers/{proxy_name}/stop?timeout=5"))
+                ),
+                format!(
+                    "DELETE {}",
+                    api_path(&format!(
+                        "/libpod/containers/{proxy_name}?force=true&v=true"
                     ))
                 ),
                 format!(
                     "DELETE {}",
-                    api_path(&format!("/libpod/volumes/{volume_name}"))
+                    api_path(&format!("/libpod/volumes/{tls_vol_name}"))
+                ),
+                format!(
+                    "DELETE {}",
+                    api_path(&format!("/libpod/volumes/{workspace_vol_name}"))
                 ),
                 format!(
                     "DELETE {}",
                     api_path(&format!("/libpod/secrets/{secret_name}"))
+                ),
+                format!(
+                    "DELETE {}",
+                    api_path(&format!("/libpod/networks/{internal_net}"))
                 ),
             ]
         );

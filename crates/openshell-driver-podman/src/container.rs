@@ -39,9 +39,18 @@ pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.sandbox-namespace";
 pub const LABEL_MANAGED: &str = "openshell.managed";
 /// Label filter string for list/event queries.
 pub const LABEL_MANAGED_FILTER: &str = "openshell.managed=true";
+/// Label key for the container role (proxy or agent) in the sidecar architecture.
+pub const LABEL_ROLE: &str = "openshell.role";
+/// Role value for the proxy sidecar container.
+pub const ROLE_PROXY: &str = "proxy";
+/// Role value for the agent container.
+pub const ROLE_AGENT: &str = "agent";
 
 /// Container name prefix to avoid collisions with user containers.
 const CONTAINER_PREFIX: &str = "openshell-sandbox-";
+
+/// Proxy sidecar container name prefix.
+const PROXY_PREFIX: &str = "openshell-proxy-";
 
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
@@ -51,16 +60,34 @@ const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 
-/// Build a Podman container name from the sandbox name.
+/// Build a Podman container name from the sandbox name (used for the agent container).
 #[must_use]
 pub fn container_name(sandbox_name: &str) -> String {
     format!("{CONTAINER_PREFIX}{sandbox_name}")
+}
+
+/// Build the proxy sidecar container name from the sandbox name.
+#[must_use]
+pub fn proxy_container_name(sandbox_name: &str) -> String {
+    format!("{PROXY_PREFIX}{sandbox_name}")
 }
 
 /// Build the workspace volume name from the sandbox ID.
 #[must_use]
 pub fn volume_name(sandbox_id: &str) -> String {
     format!("{VOLUME_PREFIX}{sandbox_id}-workspace")
+}
+
+/// Build the TLS volume name for mTLS material shared between proxy and agent.
+#[must_use]
+pub fn tls_volume_name(sandbox_id: &str) -> String {
+    format!("openshell-tls-{sandbox_id}")
+}
+
+/// Build the internal network name for sandbox isolation.
+#[must_use]
+pub fn internal_network_name(sandbox_id: &str) -> String {
+    format!("openshell-sbx-{sandbox_id}")
 }
 
 /// Podman secret name prefix.
@@ -116,10 +143,6 @@ struct ContainerSpec {
     /// the gateway server running on the host in rootless mode.
     hostadd: Vec<String>,
     netns: NetNS,
-    // Matches libpod's network spec format, which is `{name: {opts}}` where
-    // empty opts is a unit struct rather than `()`. Keep as a map so JSON
-    // serialization matches the API exactly.
-    #[allow(clippy::zero_sized_map_values)]
     networks: BTreeMap<String, NetworkAttachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     devices: Option<Vec<LinuxDevice>>,
@@ -128,6 +151,27 @@ struct ContainerSpec {
     /// Port mappings from host to container. Using `host_port=0` requests an
     /// ephemeral port, readable back from the inspect response.
     portmappings: Vec<PortMapping>,
+    /// Custom DNS servers for the container. Maps to Podman's `dns_server`
+    /// field in the libpod `SpecGenerator`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dns_server: Vec<String>,
+    /// Paths to unmask in /proc and /sys for nested-container support.
+    ///
+    /// Podman's libpod `SpecGenerator` `unmask` field accepts a list of paths
+    /// to expose inside the container that are ordinarily masked/read-only
+    /// for security. Required for nested podman to read `/proc/*` and manage
+    /// cgroups under `/sys/fs/cgroup`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unmask: Vec<String>,
+    /// `SELinux` process label options.
+    ///
+    /// The libpod `SpecGenerator` `selinux_opts` field corresponds to the
+    /// CLI `--security-opt label=<value>` flag. Setting `["disable"]` is
+    /// equivalent to `--security-opt label=disable`, which disables `SELinux`
+    /// confinement for the container — necessary for nested containers to
+    /// bind-mount host paths and manage their own overlayfs layers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    selinux_opts: Vec<String>,
 }
 
 /// A port mapping entry for the libpod `SpecGenerator`.
@@ -210,7 +254,15 @@ struct NetNS {
 }
 
 #[derive(Serialize)]
-struct NetworkAttachment {}
+struct NetworkAttachment {
+    /// Static IP address for this network attachment.
+    ///
+    /// Note: static IPs on multi-network containers require `podman network
+    /// connect --ip` at runtime; this field is reserved for future use with
+    /// single-network containers or post-connect workflows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    static_ip: Option<String>,
+}
 
 #[derive(Serialize)]
 struct LinuxDevice {
@@ -354,24 +406,121 @@ fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
     }
 }
 
+/// Determine whether the sandbox should be created in nested (passthrough) mode.
+///
+/// Nested mode runs the supervisor for SSH/exec but skips all security
+/// enforcement (Landlock, seccomp, netns, privilege dropping). The container
+/// runs with elevated capabilities needed for nested containerization.
+///
+/// Returns `true` when the template's `mode` field is set to
+/// `SANDBOX_MODE_NESTED` (2), indicating the sandbox is intended for
+/// inner-container workloads (e.g. running Podman inside the sandbox).
+pub(crate) fn is_nested_mode(sandbox: &DriverSandbox) -> bool {
+    sandbox
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.as_ref())
+        .is_some_and(|t| t.mode == 2)
+}
+
 /// Build the Podman container creation JSON spec.
+///
+/// This function only handles passthrough (nested) mode. For supervised mode,
+/// callers must use [`build_proxy_sidecar_spec`] and [`build_agent_container_spec`]
+/// directly to produce the two-container sidecar topology.
+///
+/// # Panics
+///
+/// Panics if called for a non-nested sandbox. Supervised mode requires the
+/// sidecar API (`build_proxy_sidecar_spec` + `build_agent_container_spec`).
 #[must_use]
 pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
+    assert!(
+        is_nested_mode(sandbox),
+        "use build_proxy_sidecar_spec + build_agent_container_spec for supervised mode"
+    );
+    build_container_spec_passthrough(sandbox, config)
+}
+
+/// Build a nested container spec: supervisor injected for SSH/exec, but no
+/// inner sandboxing (no Landlock, no seccomp, no netns, no privilege dropping).
+///
+/// The container runs with the kernel permissions needed for nested
+/// containerization (`unmask`, `selinux_opts`, `no_new_privileges=false`).
+/// The supervisor binary is side-loaded and provides SSH access, but tells
+/// the sandbox runtime to skip all security enforcement via `OPENSHELL_MODE=nested`.
+fn build_container_spec_passthrough(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+) -> Value {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env(sandbox, config, image);
+    // Use the full supervisor env but add OPENSHELL_MODE=nested to signal
+    // the supervisor to skip security enforcement.
+    let mut env = build_env(sandbox, config, image);
+    env.insert("OPENSHELL_MODE".into(), "nested".into());
+
+    // Inject GOOGLE_APPLICATION_CREDENTIALS for ADC support.
+    if config.adc_host_path.is_some() {
+        env.entry("GOOGLE_APPLICATION_CREDENTIALS".into())
+            .or_insert_with(|| "/run/gcloud/adc.json".into());
+    }
+
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox);
     let devices = build_devices(sandbox);
 
-    // Network configuration -- always bridge mode.
-    // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
-    // value mirrors empty opts in the JSON.
-    #[allow(clippy::zero_sized_map_values)]
     let mut networks = BTreeMap::new();
-    networks.insert(config.network_name.clone(), NetworkAttachment {});
+    networks.insert(config.network_name.clone(), NetworkAttachment { static_ip: None });
+
+    // Build mounts: TLS bind-mounts (if configured) + ADC bind-mount (if configured)
+    // + tmpfs for /run/netns (needed by the supervisor for network namespace operations).
+    let mut mounts = Vec::new();
+    if let Some(host_path) = &config.adc_host_path {
+        mounts.push(Mount {
+            kind: "bind".into(),
+            source: host_path.to_string_lossy().into_owned(),
+            destination: "/run/gcloud/adc.json".into(),
+            options: vec!["ro".into(), "rbind".into()],
+        });
+    }
+    mounts.push(Mount {
+        kind: "tmpfs".into(),
+        source: "tmpfs".into(),
+        destination: "/run/netns".into(),
+        options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
+    });
+    // Bind-mount client TLS materials into the container when mTLS is enabled.
+    if let (Some(ca), Some(cert), Some(key)) = (
+        &config.guest_tls_ca,
+        &config.guest_tls_cert,
+        &config.guest_tls_key,
+    ) {
+        let mut ro = vec!["ro".into(), "rbind".into()];
+        if is_selinux_enabled() {
+            ro.push("z".into());
+        }
+        mounts.push(Mount {
+            kind: "bind".into(),
+            source: ca.display().to_string(),
+            destination: TLS_CA_MOUNT_PATH.into(),
+            options: ro.clone(),
+        });
+        mounts.push(Mount {
+            kind: "bind".into(),
+            source: cert.display().to_string(),
+            destination: TLS_CERT_MOUNT_PATH.into(),
+            options: ro.clone(),
+        });
+        mounts.push(Mount {
+            kind: "bind".into(),
+            source: key.display().to_string(),
+            destination: TLS_KEY_MOUNT_PATH.into(),
+            options: ro,
+        });
+    }
 
     let container_spec = ContainerSpec {
         name,
@@ -383,97 +532,358 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             dest: "/sandbox".into(),
             options: vec!["rw".into()],
         }],
-        // Side-load the supervisor binary from a standalone OCI image.
-        // Podman resolves image_volumes at the libpod layer, mounting the
-        // image's filesystem at the destination path without starting a
-        // container from it. The supervisor image is FROM scratch with just
-        // the binary at /openshell-sandbox, so it appears at
-        // /opt/openshell/bin/openshell-sandbox.
+        // Side-load the supervisor binary, same as supervised mode.
         image_volumes: vec![ImageVolume {
             source: config.supervisor_image.clone(),
             destination: "/opt/openshell/bin".into(),
             rw: false,
         }],
         hostname: format!("sandbox-{}", sandbox.name),
-        // Override the image's ENTRYPOINT so the supervisor binary runs
-        // directly. Sandbox images (e.g. the community base image) set
-        // ENTRYPOINT ["/bin/bash"], and Podman's `command` field only
-        // overrides CMD — which gets appended as args to the entrypoint.
-        // Without this, the container would run `/bin/bash /opt/openshell/bin/openshell-sandbox`
-        // and bash would fail trying to interpret the binary as a script.
+        // Run the supervisor as the entrypoint so SSH/exec are available.
         entrypoint: vec!["/opt/openshell/bin/openshell-sandbox".into()],
         command: vec![],
-        // Force the supervisor to run as root (UID 0). Sandbox images may
-        // set a non-root USER directive (e.g. `USER sandbox`), but the
-        // supervisor needs root to create network namespaces, set up the
-        // proxy, and configure Landlock/seccomp. This matches the K8s
-        // driver's runAsUser: 0.
+        // Run as root so nested container tools (podman, buildah) have the
+        // permissions needed to manage storage, create namespaces, and call
+        // newuidmap/newgidmap for rootless inner containers.
         user: "0:0".into(),
-        // Podman's default container capability set is already restricted:
-        //   CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP
-        //   NET_BIND_SERVICE SYS_CHROOT SETFCAP
-        // We add what the supervisor needs and drop what it doesn't.
+        // Minimal capability drop for nested mode. We keep SYS_ADMIN and
+        // NET_ADMIN for nested podman and drop only clearly unnecessary caps.
+        cap_drop: vec!["NET_BIND_SERVICE".into(), "NET_RAW".into()],
+        cap_add: vec![
+            // Required for nested container runtimes (unshare, mount, etc.).
+            "SYS_ADMIN".into(),
+            // Required for inner network namespace creation.
+            "NET_ADMIN".into(),
+        ],
+        // Must be false: nested container runtimes need privilege transitions
+        // (e.g. newuidmap/newgidmap for rootless inner containers).
+        no_new_privileges: false,
+        // Outer seccomp must be unconfined so the inner runtime can install
+        // its own seccomp filter and use mount/clone/unshare syscalls.
+        seccomp_profile_path: "unconfined".into(),
+        image_pull_policy: config.image_pull_policy.as_str().to_string(),
+        // Health check: supervisor SSH socket or port ready.
+        healthconfig: HealthConfig {
+            test: vec![
+                "CMD-SHELL".into(),
+                format!(
+                    "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
+                    config.sandbox_ssh_socket_path, config.ssh_port
+                ),
+            ],
+            interval: 3_000_000_000,
+            timeout: 2_000_000_000,
+            retries: 10,
+            start_period: 5_000_000_000,
+        },
+        resource_limits,
+        // Inject the SSH handshake secret via Podman's secret_env map.
+        secret_env: BTreeMap::from([(
+            "OPENSHELL_SSH_HANDSHAKE_SECRET".into(),
+            secret_name(&sandbox.id),
+        )]),
+        stop_timeout: config.stop_timeout_secs,
+        hostadd: vec![
+            "host.containers.internal:host-gateway".into(),
+            "host.openshell.internal:host-gateway".into(),
+        ],
+        netns: NetNS {
+            nsmode: "bridge".to_string(),
+        },
+        networks,
+        // Add /dev/fuse so inner rootless Podman can use fuse-overlayfs as
+        // its storage driver. Without this, rootless containers inside the
+        // sandbox fall back to vfs (slow/large) or fail entirely on kernels
+        // that don't support native overlayfs in user namespaces.
+        devices: {
+            let mut devs = devices.unwrap_or_default();
+            devs.push(LinuxDevice {
+                path: "/dev/fuse".into(),
+            });
+            Some(devs)
+        },
+        mounts,
+        // Publish the SSH port with host_port=0 to get an ephemeral host port.
+        portmappings: vec![PortMapping {
+            host_port: 0,
+            container_port: config.ssh_port,
+            protocol: "tcp".into(),
+        }],
+        dns_server: vec![],
+        // Unmask /proc/* and /sys/fs/cgroup so the inner container runtime
+        // can read process info and manage cgroups. Without these, Podman
+        // inside the container fails when trying to inspect or create containers.
+        unmask: vec!["/proc/*".into(), "/sys/fs/cgroup".into()],
+        // Disable SELinux confinement for the container. Inner container
+        // runtimes need to create bind mounts and manage overlayfs layers;
+        // SELinux label enforcement blocks these on SELinux-enabled hosts.
+        selinux_opts: vec!["disable".into()],
+    };
+
+    serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
+}
+
+/// Proxy sidecar resource limits: 1 CPU core, 512 MiB memory.
+const PROXY_CPU_QUOTA: u64 = 100_000;
+const PROXY_MEMORY_LIMIT: u64 = 536_870_912; // 512 MiB
+
+/// Build the proxy sidecar container spec for the sidecar architecture.
+///
+/// The proxy container runs the supervisor in `proxy` mode, handling all
+/// network enforcement (egress filtering, mTLS termination). It is created
+/// on the internal network first; the driver connects it to the bridge
+/// network via `network_connect` after creation.
+#[must_use]
+pub fn build_proxy_sidecar_spec(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    internal_network: &str,
+    host_dns_servers: &[String],
+) -> Value {
+    let name = proxy_container_name(&sandbox.name);
+    let tls_vol = tls_volume_name(&sandbox.id);
+
+    let mut labels = build_labels(sandbox);
+    labels.insert(LABEL_ROLE.into(), ROLE_PROXY.into());
+
+    // Proxy env: minimal set — the proxy doesn't run user workloads.
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+
+    // Propagate log level from spec if set.
+    if let Some(spec) = sandbox.spec.as_ref() {
+        if !spec.log_level.is_empty() {
+            env.insert("OPENSHELL_LOG_LEVEL".into(), spec.log_level.clone());
+        }
+    }
+
+    env.insert("OPENSHELL_MODE".into(), "proxy".into());
+    env.insert("OPENSHELL_ENDPOINT".into(), config.grpc_endpoint.clone());
+    env.insert("OPENSHELL_SANDBOX_ID".into(), sandbox.id.clone());
+    env.insert("OPENSHELL_SANDBOX".into(), sandbox.name.clone());
+    env.insert(
+        "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS".into(),
+        config.ssh_handshake_skew_secs.to_string(),
+    );
+
+    // Internal network only (bridge added later via network_connect).
+    #[allow(clippy::zero_sized_map_values)]
+    let mut networks = BTreeMap::new();
+    networks.insert(
+        internal_network.to_string(),
+        NetworkAttachment { static_ip: None },
+    );
+
+    // The proxy sidecar uses the same sandbox base image as the agent so it has
+    // a working dynamic linker, CA certs, and common tools (curl for health checks).
+    // The supervisor binary is sideloaded from the supervisor OCI image via
+    // image_volumes, same as the agent container.
+    let proxy_base_image = resolve_image(sandbox, config);
+
+    let container_spec = ContainerSpec {
+        name,
+        image: proxy_base_image.to_string(),
+        labels,
+        env,
+        volumes: vec![NamedVolume {
+            name: tls_vol,
+            dest: "/openshell-tls".into(),
+            options: vec!["rw".into()],
+        }],
+        // Side-load the supervisor binary from the supervisor OCI image.
+        image_volumes: vec![ImageVolume {
+            source: config.supervisor_image.clone(),
+            destination: "/opt/openshell/bin".into(),
+            rw: false,
+        }],
+        hostname: format!("proxy-{}", sandbox.name),
+        entrypoint: vec!["/opt/openshell/bin/openshell-sandbox".into()],
+        command: vec![],
+        user: "0:0".into(),
+        // Minimal capability set for the proxy: no /proc scanning needed.
         cap_drop: vec![
-            // Not needed: standard file permission bits are sufficient; dropping
-            // prevents the supervisor from bypassing DAC checks it shouldn't need.
             "DAC_OVERRIDE".into(),
-            // Not needed: the supervisor does not create setuid/setgid executables.
             "FSETID".into(),
-            // Not needed: the supervisor does not send signals to arbitrary processes.
             "KILL".into(),
-            // Not needed: the supervisor does not bind privileged ports (<1024).
             "NET_BIND_SERVICE".into(),
-            // Not in Podman's default set but explicitly denied in case the image
-            // or runtime adds it; raw sockets are not required.
             "NET_RAW".into(),
-            // Not needed: the supervisor does not manipulate file capabilities.
             "SETFCAP".into(),
-            // Not needed: the supervisor does not manage its own capability bounding set.
             "SETPCAP".into(),
-            // Not needed: the supervisor does not call chroot().
             "SYS_CHROOT".into(),
         ],
         cap_add: vec![
-            // seccomp filter installation, namespace creation, Landlock setup.
+            // Potential seccomp/Landlock in future, namespace creation.
             "SYS_ADMIN".into(),
-            // Network namespace veth setup, IP/route configuration.
+            // Network configuration for proxy operations.
             "NET_ADMIN".into(),
-            // Reading /proc/<pid>/exe and ancestor walk for process identity in policy.
-            "SYS_PTRACE".into(),
-            // Reading /dev/kmsg for bypass-detection diagnostics.
-            "SYSLOG".into(),
-            // Reading /proc/<pid>/fd/ across UIDs for process identity resolution.
-            // In rootless Podman the supervisor runs as UID 0 inside a user namespace
-            // while sandbox processes run as the sandbox user. The kernel's
-            // proc_fd_permission() calls generic_permission() which denies cross-UID
-            // access to the dr-x------ fd directory unless this cap is present.
-            // Without it the proxy cannot determine which binary made each outbound
-            // connection and all traffic is denied.
-            "DAC_READ_SEARCH".into(),
+            // No SYS_PTRACE: proxy does not scan /proc.
+            // No DAC_READ_SEARCH: proxy does not read /proc/<pid>/fd/.
         ],
-        // SETUID, SETGID, CHOWN, and FOWNER are intentionally kept from Podman's
-        // default set and not dropped:
-        //   SETUID/SETGID – drop_privileges(): setuid()/setgid()/initgroups() to the
-        //                   sandbox user. In rootless Podman cap_drop:ALL removes them
-        //                   from the bounding set even though uid=0 owns the user
-        //                   namespace — so we keep them by not dropping them explicitly.
-        //   CHOWN         – prepare_filesystem(): chown(path, uid, gid) on newly
-        //                   created read_write directories so the sandbox user can
-        //                   write to them.
-        //   FOWNER        – chown on files where the supervisor is not the owner
-        //                   (e.g. pre-existing directories owned by another user).
-        //
-        // Disable the container-level seccomp profile. The sandbox supervisor The sandbox supervisor
-        // installs its own policy-aware BPF seccomp filter at runtime via
-        // seccompiler (two-phase: clone3 blocker + main filter). The runtime
-        // filter is more restrictive than Podman's default — it blocks 20+
-        // dangerous syscalls and conditionally restricts socket domains based
-        // on network policy. The filter self-seals by blocking further
-        // seccomp(SET_MODE_FILTER) calls after installation.
-        //
-        // A container-level profile would interfere by blocking the landlock
-        // and seccomp syscalls the supervisor needs during setup, before it
-        // locks itself down.
+        no_new_privileges: true,
+        seccomp_profile_path: "unconfined".into(),
+        image_pull_policy: config.image_pull_policy.as_str().to_string(),
+        // Health: check for the TLS ready sentinel written by the proxy after
+        // mTLS material is generated.
+        healthconfig: HealthConfig {
+            test: vec![
+                "CMD-SHELL".into(),
+                "test -e /openshell-tls/.ready".into(),
+            ],
+            interval: 3_000_000_000,
+            timeout: 2_000_000_000,
+            retries: 10,
+            start_period: 5_000_000_000,
+        },
+        resource_limits: ResourceLimits {
+            cpu: CpuLimits {
+                quota: PROXY_CPU_QUOTA,
+                period: DEFAULT_CPU_PERIOD,
+            },
+            memory: MemoryLimits {
+                limit: PROXY_MEMORY_LIMIT,
+            },
+        },
+        // SSH handshake secret for proxy-side authentication.
+        secret_env: BTreeMap::from([(
+            "OPENSHELL_SSH_HANDSHAKE_SECRET".into(),
+            secret_name(&sandbox.id),
+        )]),
+        stop_timeout: config.stop_timeout_secs,
+        hostadd: vec!["host.containers.internal:host-gateway".into()],
+        netns: NetNS {
+            nsmode: "bridge".to_string(),
+        },
+        networks,
+        devices: None,
+        mounts: vec![],
+        // No port mappings: proxy is only reachable from the internal network.
+        portmappings: vec![],
+        dns_server: host_dns_servers.to_vec(),
+        unmask: vec![],
+        selinux_opts: vec![],
+    };
+
+    serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
+}
+
+/// Build the agent container spec for the sidecar architecture.
+///
+/// The agent container runs the user sandbox image with the supervisor
+/// side-loaded. It connects only to the internal network (no bridge) and
+/// routes all external traffic through the proxy sidecar via HTTP_PROXY.
+#[must_use]
+pub fn build_agent_container_spec(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    internal_network: &str,
+    proxy_ip: &str,
+    tls_volume: &str,
+) -> Value {
+    let image = resolve_image(sandbox, config);
+    let name = container_name(&sandbox.name);
+    let workspace_vol = volume_name(&sandbox.id);
+
+    let mut env = build_env(sandbox, config, image);
+
+    // Sidecar mode: supervisor skips network enforcement (proxy handles it).
+    env.insert("OPENSHELL_PROXY_MODE".into(), "sidecar".into());
+
+    // Route gRPC traffic through the proxy's TCP forwarder.
+    env.insert(
+        "OPENSHELL_ENDPOINT".into(),
+        format!("http://{proxy_ip}:8081"),
+    );
+
+    // HTTP proxy env vars for all outbound traffic.
+    let proxy_url = format!("http://{proxy_ip}:3128");
+    env.insert("HTTP_PROXY".into(), proxy_url.clone());
+    env.insert("HTTPS_PROXY".into(), proxy_url);
+    // Include the proxy IP in NO_PROXY so gRPC traffic to the TCP forwarder
+    // (on proxy_ip:8081) is NOT double-proxied through the L7 proxy on :3128.
+    let no_proxy = format!("127.0.0.1,localhost,::1,{proxy_ip}");
+    env.insert("NO_PROXY".into(), no_proxy.clone());
+    env.insert("no_proxy".into(), no_proxy);
+
+    // CA trust env vars pointing to the proxy's CA certificate on the shared
+    // TLS volume. The proxy writes openshell-ca.pem (just the CA) and
+    // ca-bundle.pem (system CAs + proxy CA combined).
+    let ca_bundle = "/openshell-tls/ca-bundle.pem";
+    let ca_cert = "/openshell-tls/openshell-ca.pem";
+    env.insert("SSL_CERT_FILE".into(), ca_bundle.into());
+    env.insert("NODE_EXTRA_CA_CERTS".into(), ca_cert.into());
+    env.insert("CURL_CA_BUNDLE".into(), ca_bundle.into());
+    env.insert("GIT_SSL_CAINFO".into(), ca_bundle.into());
+    env.insert("REQUESTS_CA_BUNDLE".into(), ca_bundle.into());
+
+    // Block SSH to force HTTPS usage.
+    env.insert(
+        "GIT_SSH_COMMAND".into(),
+        "echo 'SSH disabled — use HTTPS' && exit 1".into(),
+    );
+
+    let mut labels = build_labels(sandbox);
+    labels.insert(LABEL_ROLE.into(), ROLE_AGENT.into());
+
+    let resource_limits = build_resource_limits(sandbox);
+    let devices = build_devices(sandbox);
+
+    // Internal network only — no bridge connection (this is the isolation boundary).
+    #[allow(clippy::zero_sized_map_values)]
+    let mut networks = BTreeMap::new();
+    networks.insert(
+        internal_network.to_string(),
+        NetworkAttachment { static_ip: None },
+    );
+
+    let container_spec = ContainerSpec {
+        name,
+        image: image.to_string(),
+        labels,
+        env,
+        volumes: vec![
+            NamedVolume {
+                name: workspace_vol,
+                dest: "/sandbox".into(),
+                options: vec!["rw".into()],
+            },
+            NamedVolume {
+                name: tls_volume.to_string(),
+                dest: "/openshell-tls".into(),
+                // Read-only: only the proxy writes TLS material.
+                options: vec!["ro".into()],
+            },
+        ],
+        // Side-load the supervisor binary from the supervisor OCI image.
+        image_volumes: vec![ImageVolume {
+            source: config.supervisor_image.clone(),
+            destination: "/opt/openshell/bin".into(),
+            rw: false,
+        }],
+        hostname: format!("sandbox-{}", sandbox.name),
+        entrypoint: vec!["/opt/openshell/bin/openshell-sandbox".into()],
+        command: vec![],
+        user: "0:0".into(),
+        // Reduced capability set: no SYS_PTRACE or DAC_READ_SEARCH needed
+        // in sidecar mode (no /proc scanning — proxy handles process identity).
+        cap_drop: vec![
+            "DAC_OVERRIDE".into(),
+            "FSETID".into(),
+            "KILL".into(),
+            "NET_BIND_SERVICE".into(),
+            "NET_RAW".into(),
+            "SETFCAP".into(),
+            "SETPCAP".into(),
+            "SYS_CHROOT".into(),
+        ],
+        cap_add: vec![
+            // Namespace creation, Landlock setup.
+            "SYS_ADMIN".into(),
+            // Network configuration (if needed for local netns).
+            "NET_ADMIN".into(),
+            // Kernel log reading for bypass-detection diagnostics.
+            "SYSLOG".into(),
+            // No SYS_PTRACE: not needed in sidecar mode.
+            // No DAC_READ_SEARCH: not needed in sidecar mode.
+        ],
         no_new_privileges: true,
         seccomp_profile_path: "unconfined".into(),
         image_pull_policy: config.image_pull_policy.as_str().to_string(),
@@ -491,12 +901,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             start_period: 5_000_000_000,
         },
         resource_limits,
-        // Inject the SSH handshake secret via Podman's secret_env map so it
-        // does not appear in `podman inspect` output. The libpod SpecGenerator
-        // uses `secret_env` (map of env_var → secret_name) for env-type secrets,
-        // distinct from `secrets` which only handles file mounts under /run/secrets/.
-        // The secret is created by the driver before the container
-        // (see `PodmanComputeDriver::create_sandbox`).
+        // SSH handshake secret for agent-side authentication.
         secret_env: BTreeMap::from([(
             "OPENSHELL_SSH_HANDSHAKE_SECRET".into(),
             secret_name(&sandbox.id),
@@ -573,6 +978,11 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             container_port: config.ssh_port,
             protocol: "tcp".into(),
         }],
+        // No DNS override: internal DNS resolves container names; external
+        // DNS is irrelevant since all traffic goes through the proxy.
+        dns_server: vec![],
+        unmask: vec![],
+        selinux_opts: vec![],
     };
 
     serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
@@ -669,10 +1079,31 @@ mod tests {
     }
 
     #[test]
+    fn proxy_container_name_is_prefixed() {
+        assert_eq!(
+            proxy_container_name("my-sandbox"),
+            "openshell-proxy-my-sandbox"
+        );
+    }
+
+    #[test]
     fn volume_name_uses_id() {
         assert_eq!(
             volume_name("abc-123"),
             "openshell-sandbox-abc-123-workspace"
+        );
+    }
+
+    #[test]
+    fn tls_volume_name_uses_id() {
+        assert_eq!(tls_volume_name("abc-123"), "openshell-tls-abc-123");
+    }
+
+    #[test]
+    fn internal_network_name_uses_id() {
+        assert_eq!(
+            internal_network_name("abc-123"),
+            "openshell-sbx-abc-123"
         );
     }
 
@@ -687,11 +1118,13 @@ mod tests {
         assert_eq!(short_id("short"), "short");
     }
 
+    // --- Proxy sidecar spec tests ---
+
     #[test]
-    fn container_spec_includes_required_capabilities() {
+    fn proxy_spec_has_minimal_capabilities() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_proxy_sidecar_spec(&sandbox, &config, "openshell-sbx-test-id", &[]);
 
         let added: Vec<&str> = spec["cap_add"]
             .as_array()
@@ -699,20 +1132,168 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert!(added.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
-        assert!(added.contains(&"NET_ADMIN"), "missing NET_ADMIN");
-        assert!(added.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
-        assert!(added.contains(&"SYSLOG"), "missing SYSLOG");
+        assert!(added.contains(&"SYS_ADMIN"), "proxy missing SYS_ADMIN");
+        assert!(added.contains(&"NET_ADMIN"), "proxy missing NET_ADMIN");
+        // Proxy must NOT have SYS_PTRACE or DAC_READ_SEARCH.
         assert!(
-            added.contains(&"DAC_READ_SEARCH"),
-            "missing DAC_READ_SEARCH"
+            !added.contains(&"SYS_PTRACE"),
+            "proxy must not have SYS_PTRACE"
+        );
+        assert!(
+            !added.contains(&"DAC_READ_SEARCH"),
+            "proxy must not have DAC_READ_SEARCH"
+        );
+    }
+
+    #[test]
+    fn proxy_spec_uses_secret_env() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_proxy_sidecar_spec(&sandbox, &config, "openshell-sbx-test-id", &[]);
+
+        // Secret must NOT appear in plaintext env.
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert!(
+            !env_map.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
+            "handshake secret should not be in plaintext env"
         );
 
-        // SETUID and SETGID are NOT in cap_add — they remain available from the
-        // default bounding set because we no longer use cap_drop:ALL. Verify they
-        // are also not explicitly dropped. Similarly CHOWN and FOWNER must not be
-        // dropped because prepare_filesystem() calls chown() on newly created
-        // read_write directories before the supervisor drops privileges.
+        let secret_env = spec["secret_env"]
+            .as_object()
+            .expect("secret_env should be an object");
+        assert!(
+            secret_env.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
+            "proxy secret_env should map OPENSHELL_SSH_HANDSHAKE_SECRET"
+        );
+        assert_eq!(
+            secret_env["OPENSHELL_SSH_HANDSHAKE_SECRET"].as_str(),
+            Some("openshell-handshake-test-id"),
+        );
+    }
+
+    #[test]
+    fn proxy_spec_has_role_label() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_proxy_sidecar_spec(&sandbox, &config, "openshell-sbx-test-id", &[]);
+
+        let labels = spec["labels"]
+            .as_object()
+            .expect("labels should be an object");
+        assert_eq!(
+            labels.get(LABEL_ROLE).and_then(|v| v.as_str()),
+            Some(ROLE_PROXY),
+            "proxy should have role=proxy label"
+        );
+    }
+
+    #[test]
+    fn proxy_spec_has_tls_volume_rw() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_proxy_sidecar_spec(&sandbox, &config, "openshell-sbx-test-id", &[]);
+
+        let volumes = spec["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+        let tls_vol = volumes
+            .iter()
+            .find(|v| v["dest"].as_str() == Some("/openshell-tls"))
+            .expect("proxy should mount TLS volume");
+        let options: Vec<&str> = tls_vol["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(options.contains(&"rw"), "proxy TLS volume should be rw");
+    }
+
+    #[test]
+    fn proxy_spec_sets_dns_servers() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let dns = vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
+        let spec = build_proxy_sidecar_spec(&sandbox, &config, "openshell-sbx-test-id", &dns);
+
+        let dns_server: Vec<&str> = spec["dns_server"]
+            .as_array()
+            .expect("dns_server should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(dns_server, vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    #[test]
+    fn proxy_spec_has_no_port_mappings() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_proxy_sidecar_spec(&sandbox, &config, "openshell-sbx-test-id", &[]);
+
+        // portmappings should be empty (skip_serializing_if = "Vec::is_empty").
+        assert!(
+            spec.get("portmappings").is_none()
+                || spec["portmappings"]
+                    .as_array()
+                    .is_none_or(|a| a.is_empty()),
+            "proxy should not expose any ports"
+        );
+    }
+
+    #[test]
+    fn proxy_spec_healthcheck_checks_tls_ready() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_proxy_sidecar_spec(&sandbox, &config, "openshell-sbx-test-id", &[]);
+
+        let test_cmd = spec["healthconfig"]["test"]
+            .as_array()
+            .expect("healthcheck test should be an array");
+        let command = test_cmd
+            .get(1)
+            .and_then(|v| v.as_str())
+            .expect("healthcheck should include shell command");
+        assert!(
+            command.contains("/openshell-tls/.ready"),
+            "proxy healthcheck should check for TLS ready sentinel"
+        );
+    }
+
+    // --- Agent container spec tests ---
+
+    #[test]
+    fn agent_spec_has_reduced_capabilities() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
+
+        let added: Vec<&str> = spec["cap_add"]
+            .as_array()
+            .expect("cap_add should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(added.contains(&"SYS_ADMIN"), "agent missing SYS_ADMIN");
+        assert!(added.contains(&"NET_ADMIN"), "agent missing NET_ADMIN");
+        assert!(added.contains(&"SYSLOG"), "agent missing SYSLOG");
+        // Agent must NOT have SYS_PTRACE or DAC_READ_SEARCH in sidecar mode.
+        assert!(
+            !added.contains(&"SYS_PTRACE"),
+            "agent must not have SYS_PTRACE in sidecar mode"
+        );
+        assert!(
+            !added.contains(&"DAC_READ_SEARCH"),
+            "agent must not have DAC_READ_SEARCH in sidecar mode"
+        );
+
+        // Verify essential caps are not dropped.
         let dropped: Vec<&str> = spec["cap_drop"]
             .as_array()
             .expect("cap_drop should be an array")
@@ -721,14 +1302,8 @@ mod tests {
             .collect();
         assert!(!dropped.contains(&"SETUID"), "SETUID must not be dropped");
         assert!(!dropped.contains(&"SETGID"), "SETGID must not be dropped");
-        assert!(
-            !dropped.contains(&"CHOWN"),
-            "CHOWN must not be dropped (needed for prepare_filesystem chown)"
-        );
-        assert!(
-            !dropped.contains(&"FOWNER"),
-            "FOWNER must not be dropped (needed for chown on non-owned files)"
-        );
+        assert!(!dropped.contains(&"CHOWN"), "CHOWN must not be dropped");
+        assert!(!dropped.contains(&"FOWNER"), "FOWNER must not be dropped");
         assert!(
             !dropped.contains(&"ALL"),
             "must not use cap_drop:ALL in rootless Podman"
@@ -736,38 +1311,47 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_uses_secret_env_not_plaintext() {
+    fn agent_spec_uses_secret_env_not_plaintext() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
 
-        // The handshake secret must NOT appear in the plaintext env map.
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert!(
             !env_map.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
             "handshake secret should not be in plaintext env"
         );
 
-        // It should appear in secret_env (the libpod env-type secret map) instead.
         let secret_env = spec["secret_env"]
             .as_object()
             .expect("secret_env should be an object");
         assert!(
             secret_env.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
-            "secret_env should map OPENSHELL_SSH_HANDSHAKE_SECRET to its secret name"
+            "agent secret_env should map OPENSHELL_SSH_HANDSHAKE_SECRET"
         );
         assert_eq!(
             secret_env["OPENSHELL_SSH_HANDSHAKE_SECRET"].as_str(),
             Some("openshell-handshake-test-id"),
-            "secret_env value should be the Podman secret name for the sandbox"
         );
     }
 
     #[test]
-    fn container_spec_sets_sandbox_name_in_env() {
+    fn agent_spec_sets_sandbox_name_in_env() {
         let sandbox = test_sandbox("test-id", "my-sandbox");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
@@ -777,10 +1361,16 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_sets_ssh_socket_path_in_env() {
+    fn agent_spec_sets_ssh_socket_path_in_env() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
@@ -792,10 +1382,16 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_healthcheck_accepts_supervisor_socket() {
+    fn agent_spec_healthcheck_accepts_supervisor_socket() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
 
         let healthcheck = spec["healthconfig"]["test"]
             .as_array()
@@ -811,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_required_vars_cannot_be_overridden() {
+    fn agent_spec_required_vars_cannot_be_overridden() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "legit-name");
@@ -832,14 +1428,21 @@ mod tests {
         });
 
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
 
         let env_map = spec["env"].as_object().expect("env should be an object");
 
+        // OPENSHELL_ENDPOINT is overwritten by the sidecar proxy address.
         assert_eq!(
             env_map.get("OPENSHELL_ENDPOINT").and_then(|v| v.as_str()),
-            Some("http://localhost:50051"),
-            "OPENSHELL_ENDPOINT must not be overridden by user env"
+            Some("http://10.89.0.2:8081"),
+            "OPENSHELL_ENDPOINT must point to proxy, not be overridden by user env"
         );
         assert_eq!(
             env_map.get("OPENSHELL_SANDBOX_ID").and_then(|v| v.as_str()),
@@ -856,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_required_labels_cannot_be_overridden() {
+    fn agent_spec_required_labels_cannot_be_overridden() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("real-id", "real-name");
@@ -880,7 +1483,13 @@ mod tests {
         });
 
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-real-id",
+            "10.89.0.2",
+            "openshell-tls-real-id",
+        );
 
         let labels = spec["labels"]
             .as_object()
@@ -908,7 +1517,7 @@ mod tests {
 
     #[test]
     fn container_spec_injects_host_aliases() {
-        let sandbox = test_sandbox("test-id", "test-name");
+        let sandbox = test_nested_sandbox("test-id", "test-name");
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
@@ -931,6 +1540,220 @@ mod tests {
             !hostadd.contains(&"host.docker.internal:host-gateway"),
             "Podman should not inject Docker's host alias"
         );
+    }
+
+    #[test]
+    fn agent_spec_has_role_label() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
+
+        let labels = spec["labels"]
+            .as_object()
+            .expect("labels should be an object");
+        assert_eq!(
+            labels.get(LABEL_ROLE).and_then(|v| v.as_str()),
+            Some(ROLE_AGENT),
+            "agent should have role=agent label"
+        );
+    }
+
+    #[test]
+    fn agent_spec_has_proxy_env_vars() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+
+        assert_eq!(
+            env_map.get("HTTP_PROXY").and_then(|v| v.as_str()),
+            Some("http://10.89.0.2:3128"),
+            "HTTP_PROXY should point to proxy sidecar"
+        );
+        assert_eq!(
+            env_map.get("HTTPS_PROXY").and_then(|v| v.as_str()),
+            Some("http://10.89.0.2:3128"),
+            "HTTPS_PROXY should point to proxy sidecar"
+        );
+        assert_eq!(
+            env_map.get("NO_PROXY").and_then(|v| v.as_str()),
+            Some("127.0.0.1,localhost,::1,10.89.0.2"),
+            "NO_PROXY must include proxy IP to avoid double-proxying gRPC traffic"
+        );
+        assert_eq!(
+            env_map.get("no_proxy").and_then(|v| v.as_str()),
+            Some("127.0.0.1,localhost,::1,10.89.0.2"),
+            "no_proxy must include proxy IP to avoid double-proxying gRPC traffic"
+        );
+        assert_eq!(
+            env_map.get("OPENSHELL_PROXY_MODE").and_then(|v| v.as_str()),
+            Some("sidecar"),
+            "OPENSHELL_PROXY_MODE should be 'sidecar'"
+        );
+        assert_eq!(
+            env_map.get("OPENSHELL_ENDPOINT").and_then(|v| v.as_str()),
+            Some("http://10.89.0.2:8081"),
+            "OPENSHELL_ENDPOINT should route through proxy"
+        );
+    }
+
+    #[test]
+    fn agent_spec_has_ca_trust_env_vars() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        let ca_bundle = "/openshell-tls/ca-bundle.pem";
+        let ca_cert = "/openshell-tls/openshell-ca.pem";
+        // Bundle-based env vars should point to the combined CA bundle.
+        for var in &["SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "REQUESTS_CA_BUNDLE"] {
+            assert_eq!(
+                env_map.get(*var).and_then(|v| v.as_str()),
+                Some(ca_bundle),
+                "{var} should point to {ca_bundle}"
+            );
+        }
+        // Node.js needs just the proxy CA cert (not the full bundle).
+        assert_eq!(
+            env_map.get("NODE_EXTRA_CA_CERTS").and_then(|v| v.as_str()),
+            Some(ca_cert),
+            "NODE_EXTRA_CA_CERTS should point to {ca_cert}"
+        );
+    }
+
+    #[test]
+    fn agent_spec_blocks_git_ssh() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        let git_ssh = env_map
+            .get("GIT_SSH_COMMAND")
+            .and_then(|v| v.as_str())
+            .expect("GIT_SSH_COMMAND should be set");
+        assert!(
+            git_ssh.contains("exit 1"),
+            "GIT_SSH_COMMAND should block SSH"
+        );
+    }
+
+    #[test]
+    fn agent_spec_internal_network_only() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let internal_net = "openshell-sbx-test-id";
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            internal_net,
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
+
+        let networks = spec["networks"]
+            .as_object()
+            .expect("networks should be an object");
+        assert!(
+            networks.contains_key(internal_net),
+            "agent should be on internal network"
+        );
+        assert_eq!(
+            networks.len(),
+            1,
+            "agent should ONLY be on internal network (no bridge)"
+        );
+    }
+
+    #[test]
+    fn agent_spec_has_tls_volume_ro() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let tls_vol = "openshell-tls-test-id";
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            tls_vol,
+        );
+
+        let volumes = spec["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+        let tls = volumes
+            .iter()
+            .find(|v| v["dest"].as_str() == Some("/openshell-tls"))
+            .expect("agent should mount TLS volume");
+        let options: Vec<&str> = tls["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(options.contains(&"ro"), "agent TLS volume should be ro");
+        assert_eq!(
+            tls["name"].as_str(),
+            Some(tls_vol),
+            "TLS volume name should match"
+        );
+    }
+
+    #[test]
+    fn agent_spec_includes_supervisor_image_volume() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_agent_container_spec(
+            &sandbox,
+            &config,
+            "openshell-sbx-test-id",
+            "10.89.0.2",
+            "openshell-tls-test-id",
+        );
+
+        let image_volumes = spec["image_volumes"]
+            .as_array()
+            .expect("image_volumes should be an array");
+        assert_eq!(
+            image_volumes.len(),
+            1,
+            "should have exactly one image volume"
+        );
+        assert_eq!(
+            image_volumes[0]["source"].as_str(),
+            Some("openshell/supervisor:latest"),
+        );
+        assert_eq!(
+            image_volumes[0]["destination"].as_str(),
+            Some("/opt/openshell/bin"),
+        );
+        assert_eq!(image_volumes[0]["rw"].as_bool(), Some(false));
     }
 
     #[test]
@@ -966,9 +1789,23 @@ mod tests {
         }
     }
 
+    /// Helper to create a nested sandbox for test purposes.
+    fn test_nested_sandbox(id: &str, name: &str) -> DriverSandbox {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let mut sandbox = test_sandbox(id, name);
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                mode: 2, // SANDBOX_MODE_NESTED
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sandbox
+    }
+
     #[test]
     fn container_spec_includes_supervisor_image_volume() {
-        let sandbox = test_sandbox("test-id", "test-name");
+        let sandbox = test_nested_sandbox("test-id", "test-name");
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
@@ -1001,7 +1838,7 @@ mod tests {
 
     #[test]
     fn container_spec_includes_tls_mounts_when_configured() {
-        let sandbox = test_sandbox("tls-id", "tls-name");
+        let sandbox = test_nested_sandbox("tls-id", "tls-name");
         let mut config = test_config();
         config.guest_tls_ca = Some(std::path::PathBuf::from("/host/ca.crt"));
         config.guest_tls_cert = Some(std::path::PathBuf::from("/host/tls.crt"));
@@ -1065,7 +1902,7 @@ mod tests {
 
     #[test]
     fn container_spec_omits_tls_without_config() {
-        let sandbox = test_sandbox("notls-id", "notls-name");
+        let sandbox = test_nested_sandbox("notls-id", "notls-name");
         let config = test_config();
 
         let spec = build_container_spec(&sandbox, &config);
@@ -1084,5 +1921,32 @@ mod tests {
             .filter(|m| m["type"].as_str() == Some("bind"))
             .count();
         assert_eq!(bind_count, 0, "no bind mounts without TLS config");
+    }
+
+    #[test]
+    fn nested_spec_includes_adc_bind_mount_when_configured() {
+        let sandbox = test_nested_sandbox("adc-test-id", "adc-test");
+        let config = PodmanComputeConfig {
+            adc_host_path: Some(std::path::PathBuf::from("/host/adc.json")),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let adc_bind = mounts
+            .iter()
+            .find(|m| m["destination"].as_str() == Some("/run/gcloud/adc.json"));
+        assert!(adc_bind.is_some(), "ADC bind mount should be present");
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env_map
+                .get("GOOGLE_APPLICATION_CREDENTIALS")
+                .and_then(|v| v.as_str()),
+            Some("/run/gcloud/adc.json"),
+            "GOOGLE_APPLICATION_CREDENTIALS should be set for ADC"
+        );
     }
 }

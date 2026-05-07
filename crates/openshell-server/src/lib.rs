@@ -573,6 +573,11 @@ async fn build_compute_runtime(
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from);
 
+            let adc_host_path = std::env::var("OPENSHELL_PODMAN_ADC_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from);
+
             ComputeRuntime::new_podman(
                 openshell_driver_podman::PodmanComputeConfig {
                     socket_path,
@@ -590,6 +595,8 @@ async fn build_compute_runtime(
                     guest_tls_ca: podman_tls_ca,
                     guest_tls_cert: podman_tls_cert,
                     guest_tls_key: podman_tls_key,
+                    adc_host_path,
+                    host_dns_servers: Vec::new(),
                 },
                 store,
                 sandbox_index,

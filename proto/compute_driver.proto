@@ -115,6 +115,14 @@ message DriverSandboxTemplate {
   // For the Kubernetes driver this carries fields such as runtimeClassName,
   // annotations, and volumeClaimTemplates.
   google.protobuf.Struct platform_config = 11;
+  // Sandbox execution mode.
+  //
+  // 0 = default (supervised with sidecar proxy)
+  // 2 = nested (supervisor for SSH/exec, no inner security enforcement)
+  //
+  // Drivers use this to choose between sidecar topology (default) and
+  // single-container passthrough mode (nested).
+  int32 mode = 12;
 }
 
 // Typed compute-resource requirements.

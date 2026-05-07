@@ -5,7 +5,7 @@
 
 use crate::client::{PodmanApiError, PodmanClient};
 use crate::config::PodmanComputeConfig;
-use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID};
+use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_ROLE, LABEL_SANDBOX_ID, ROLE_AGENT};
 use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
@@ -151,6 +151,19 @@ impl PodmanComputeDriver {
             );
         }
 
+        // Discover host DNS resolvers for proxy sidecar containers.
+        // The proxy runs on an internal network and needs real upstream DNS
+        // servers to resolve external hostnames.
+        if config.host_dns_servers.is_empty() {
+            config.host_dns_servers = crate::config::discover_host_dns_servers();
+            if !config.host_dns_servers.is_empty() {
+                info!(
+                    dns_servers = ?config.host_dns_servers,
+                    "Discovered host DNS resolvers for proxy containers"
+                );
+            }
+        }
+
         Ok(Self {
             client,
             config,
@@ -207,7 +220,8 @@ impl PodmanComputeDriver {
         Ok(())
     }
 
-    /// Create a sandbox container.
+    /// Create a sandbox: either a single container (nested/passthrough mode)
+    /// or the 3-resource sidecar topology (internal network + proxy + agent).
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
         if sandbox.name.is_empty() {
             return Err(ComputeDriverError::Precondition(
@@ -220,11 +234,20 @@ impl PodmanComputeDriver {
             ));
         }
 
-        // Validate the composed container name early, before creating any
-        // resources (secret, volume), so we don't leave orphans when the
-        // name is invalid.
-        let name = validated_container_name(&sandbox.name)?;
+        if container::is_nested_mode(sandbox) {
+            return self.create_sandbox_passthrough(sandbox).await;
+        }
 
+        self.create_sandbox_sidecar(sandbox).await
+    }
+
+    /// Nested/passthrough mode: single container with supervisor injected
+    /// for SSH/exec, but no inner sandboxing or sidecar proxy.
+    async fn create_sandbox_passthrough(
+        &self,
+        sandbox: &DriverSandbox,
+    ) -> Result<(), ComputeDriverError> {
+        let name = validated_container_name(&sandbox.name)?;
         let vol_name = container::volume_name(&sandbox.id);
         let sec_name = container::secret_name(&sandbox.id);
 
@@ -232,7 +255,8 @@ impl PodmanComputeDriver {
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
             container = %name,
-            "Creating sandbox container"
+            mode = "nested",
+            "Creating sandbox in nested mode (supervisor with no enforcement)"
         );
 
         // 1a. Pull the supervisor image if needed. The supervisor binary
@@ -249,7 +273,7 @@ impl PodmanComputeDriver {
             .await
             .map_err(ComputeDriverError::from)?;
 
-        // 1b. Pull the sandbox image if needed (Podman does not pull on create).
+        // 1b. Pull the sandbox image.
         let image = container::resolve_image(sandbox, &self.config);
         if image.is_empty() {
             return Err(ComputeDriverError::Precondition(
@@ -283,10 +307,6 @@ impl PodmanComputeDriver {
         match self.client.create_container(&spec).await {
             Ok(_) => {}
             Err(PodmanApiError::Conflict(_)) => {
-                // Clean up the volume and secret we just created. They are
-                // keyed by *this* sandbox's ID, not the conflicting
-                // container's ID (which has the same name but a different
-                // ID), so they would be orphaned otherwise.
                 let _ = self.client.remove_volume(&vol_name).await;
                 let _ = self.client.remove_secret(&sec_name).await;
                 return Err(ComputeDriverError::AlreadyExists);
@@ -314,24 +334,200 @@ impl PodmanComputeDriver {
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
-            "Sandbox container started"
+            "Sandbox container started (nested mode)"
         );
 
         Ok(())
     }
 
-    /// Stop a sandbox container without deleting it.
-    pub async fn stop_sandbox(&self, sandbox_name: &str) -> Result<(), ComputeDriverError> {
-        let name = validated_container_name(sandbox_name)?;
-        info!(sandbox_name = %sandbox_name, container = %name, "Stopping sandbox container");
+    /// Sidecar mode: create internal network, proxy sidecar, and agent container.
+    async fn create_sandbox_sidecar(
+        &self,
+        sandbox: &DriverSandbox,
+    ) -> Result<(), ComputeDriverError> {
+        let agent_name = validated_container_name(&sandbox.name)?;
+        let proxy_name = container::proxy_container_name(&sandbox.name);
+        crate::client::validate_name(&proxy_name)
+            .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
 
+        let internal_net = container::internal_network_name(&sandbox.id);
+        let tls_vol = container::tls_volume_name(&sandbox.id);
+        let workspace_vol = container::volume_name(&sandbox.id);
+        let sec_name = container::secret_name(&sandbox.id);
+
+        info!(
+            sandbox_id = %sandbox.id,
+            sandbox_name = %sandbox.name,
+            "Creating sidecar sandbox"
+        );
+
+        // 1. Pull images (supervisor + sandbox).
         self.client
-            .stop_container(&name, self.config.stop_timeout_secs)
+            .pull_image(&self.config.supervisor_image, "missing")
             .await
-            .map_err(ComputeDriverError::from)
+            .map_err(ComputeDriverError::from)?;
+
+        let image = container::resolve_image(sandbox, &self.config);
+        if image.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "no sandbox image configured: set --sandbox-image on the server \
+                 or provide an image in the sandbox template"
+                    .to_string(),
+            ));
+        }
+        self.client
+            .pull_image(image, self.config.image_pull_policy.as_str())
+            .await
+            .map_err(ComputeDriverError::from)?;
+
+        // 2. Create internal network.
+        self.client
+            .ensure_internal_network(&internal_net)
+            .await
+            .map_err(ComputeDriverError::from)?;
+
+        // 3. Create SSH handshake secret.
+        if let Err(e) = self
+            .client
+            .create_secret(&sec_name, self.config.ssh_handshake_secret.as_bytes())
+            .await
+        {
+            let _ = self.client.remove_network(&internal_net).await;
+            return Err(ComputeDriverError::from(e));
+        }
+
+        // 4. Create workspace volume.
+        if let Err(e) = self.client.create_volume(&workspace_vol).await {
+            let _ = self.client.remove_secret(&sec_name).await;
+            let _ = self.client.remove_network(&internal_net).await;
+            return Err(ComputeDriverError::from(e));
+        }
+
+        // 5. Create TLS volume (proxy writes CA + .ready; agent reads).
+        if let Err(e) = self.client.create_volume(&tls_vol).await {
+            let _ = self.client.remove_volume(&workspace_vol).await;
+            let _ = self.client.remove_secret(&sec_name).await;
+            let _ = self.client.remove_network(&internal_net).await;
+            return Err(ComputeDriverError::from(e));
+        }
+
+        // 6. Create proxy sidecar container on internal network.
+        let host_dns = self.config.host_dns_servers.clone();
+        let proxy_spec =
+            container::build_proxy_sidecar_spec(sandbox, &self.config, &internal_net, &host_dns);
+        if let Err(e) = self.client.create_container(&proxy_spec).await {
+            let _ = self.client.remove_volume(&tls_vol).await;
+            let _ = self.client.remove_volume(&workspace_vol).await;
+            let _ = self.client.remove_secret(&sec_name).await;
+            let _ = self.client.remove_network(&internal_net).await;
+            return Err(ComputeDriverError::from(e));
+        }
+
+        // 7. Connect proxy to bridge network (gives it internet access).
+        if let Err(e) = self
+            .client
+            .network_connect(&self.config.network_name, &proxy_name)
+            .await
+        {
+            let _ = self.client.remove_container(&proxy_name).await;
+            let _ = self.client.remove_volume(&tls_vol).await;
+            let _ = self.client.remove_volume(&workspace_vol).await;
+            let _ = self.client.remove_secret(&sec_name).await;
+            let _ = self.client.remove_network(&internal_net).await;
+            return Err(ComputeDriverError::from(e));
+        }
+
+        // 8. Start proxy sidecar.
+        if let Err(e) = self.client.start_container(&proxy_name).await {
+            let _ = self.client.remove_container(&proxy_name).await;
+            let _ = self.client.remove_volume(&tls_vol).await;
+            let _ = self.client.remove_volume(&workspace_vol).await;
+            let _ = self.client.remove_secret(&sec_name).await;
+            let _ = self.client.remove_network(&internal_net).await;
+            return Err(ComputeDriverError::from(e));
+        }
+
+        // 9. Get proxy IP on internal network (needed for agent's HTTP_PROXY env).
+        //    Roll back all resources if the proxy has no IP (crash, API timeout, etc.).
+        let proxy_ip = match self.client.container_ip(&proxy_name, &internal_net).await {
+            Ok(Some(ip)) => ip,
+            result => {
+                let err_msg = match result {
+                    Ok(None) => "proxy container has no IP on internal network".to_string(),
+                    Err(e) => format!("failed to get proxy container IP: {e}"),
+                    Ok(Some(_)) => unreachable!(),
+                };
+                warn!(sandbox_name = %sandbox.name, error = %err_msg, "Rolling back sidecar sandbox");
+                let _ = self.client.stop_container(&proxy_name, 5).await;
+                let _ = self.client.remove_container(&proxy_name).await;
+                let _ = self.client.remove_volume(&tls_vol).await;
+                let _ = self.client.remove_volume(&workspace_vol).await;
+                let _ = self.client.remove_secret(&sec_name).await;
+                let _ = self.client.remove_network(&internal_net).await;
+                return Err(ComputeDriverError::Message(err_msg));
+            }
+        };
+
+        // 10. Create agent container on internal network only.
+        let agent_spec = container::build_agent_container_spec(
+            sandbox,
+            &self.config,
+            &internal_net,
+            &proxy_ip,
+            &tls_vol,
+        );
+        if let Err(e) = self.client.create_container(&agent_spec).await {
+            let _ = self.client.stop_container(&proxy_name, 5).await;
+            let _ = self.client.remove_container(&proxy_name).await;
+            let _ = self.client.remove_volume(&tls_vol).await;
+            let _ = self.client.remove_volume(&workspace_vol).await;
+            let _ = self.client.remove_secret(&sec_name).await;
+            let _ = self.client.remove_network(&internal_net).await;
+            return Err(ComputeDriverError::from(e));
+        }
+
+        // 11. Start agent container.
+        if let Err(e) = self.client.start_container(&agent_name).await {
+            let _ = self.client.remove_container(&agent_name).await;
+            let _ = self.client.stop_container(&proxy_name, 5).await;
+            let _ = self.client.remove_container(&proxy_name).await;
+            let _ = self.client.remove_volume(&tls_vol).await;
+            let _ = self.client.remove_volume(&workspace_vol).await;
+            let _ = self.client.remove_secret(&sec_name).await;
+            let _ = self.client.remove_network(&internal_net).await;
+            return Err(ComputeDriverError::from(e));
+        }
+
+        info!(
+            sandbox_id = %sandbox.id,
+            sandbox_name = %sandbox.name,
+            proxy_ip = %proxy_ip,
+            "Sidecar sandbox created"
+        );
+
+        Ok(())
     }
 
-    /// Delete a sandbox container and its workspace volume.
+    /// Stop a sandbox: agent container first, then proxy sidecar (best-effort).
+    pub async fn stop_sandbox(&self, sandbox_name: &str) -> Result<(), ComputeDriverError> {
+        let agent_name = validated_container_name(sandbox_name)?;
+        let proxy_name = container::proxy_container_name(sandbox_name);
+
+        info!(sandbox_name = %sandbox_name, container = %agent_name, "Stopping sandbox");
+
+        // Stop agent first (it depends on proxy).
+        self.client
+            .stop_container(&agent_name, self.config.stop_timeout_secs)
+            .await
+            .map_err(ComputeDriverError::from)?;
+
+        // Stop proxy (best-effort — may not exist in passthrough mode).
+        let _ = self.client.stop_container(&proxy_name, 5).await;
+
+        Ok(())
+    }
+
+    /// Delete a sandbox and all its resources (agent, proxy, volumes, secret, network).
     pub async fn delete_sandbox(
         &self,
         sandbox_id: &str,
@@ -342,24 +538,29 @@ impl PodmanComputeDriver {
                 "sandbox id is required".into(),
             ));
         }
-        let name = validated_container_name(sandbox_name)?;
+        let agent_name = validated_container_name(sandbox_name)?;
+        let proxy_name = container::proxy_container_name(sandbox_name);
+        let internal_net = container::internal_network_name(sandbox_id);
+        let tls_vol = container::tls_volume_name(sandbox_id);
+        let workspace_vol = container::volume_name(sandbox_id);
+        let sec_name = container::secret_name(sandbox_id);
+
         info!(
             sandbox_id = %sandbox_id,
             sandbox_name = %sandbox_name,
-            container = %name,
-            "Deleting sandbox container"
+            "Deleting sandbox"
         );
 
         // Use the request's stable sandbox ID as the source of truth for
         // cleanup. Inspect is only used as a best-effort cross-check so
         // cleanup still works if the container is already gone or mislabeled.
-        match self.client.inspect_container(&name).await {
+        match self.client.inspect_container(&agent_name).await {
             Ok(inspect) => match inspect.config.labels.get(LABEL_SANDBOX_ID) {
                 Some(label_id) if label_id != sandbox_id => {
                     warn!(
                         sandbox_id = %sandbox_id,
                         sandbox_name = %sandbox_name,
-                        container = %name,
+                        container = %agent_name,
                         label_sandbox_id = %label_id,
                         "Container label sandbox ID did not match delete request; cleaning up using request sandbox_id"
                     );
@@ -368,7 +569,7 @@ impl PodmanComputeDriver {
                     warn!(
                         sandbox_id = %sandbox_id,
                         sandbox_name = %sandbox_name,
-                        container = %name,
+                        container = %agent_name,
                         "Container missing '{}' label; cleaning up using request sandbox_id",
                         LABEL_SANDBOX_ID,
                     );
@@ -379,44 +580,44 @@ impl PodmanComputeDriver {
             Err(e) => return Err(ComputeDriverError::from(e)),
         }
 
-        // Stop (best-effort).
+        // Stop and remove agent container.
         let _ = self
             .client
-            .stop_container(&name, self.config.stop_timeout_secs)
+            .stop_container(&agent_name, self.config.stop_timeout_secs)
             .await;
 
-        // Remove container. If NotFound, the container was removed between
-        // inspect and here (TOCTOU race); proceed with volume/secret cleanup
-        // since those resources are idempotent to remove.
-        let container_existed = match self.client.remove_container(&name).await {
+        let agent_existed = match self.client.remove_container(&agent_name).await {
             Ok(()) => true,
             Err(PodmanApiError::NotFound(_)) => false,
             Err(e) => return Err(ComputeDriverError::from(e)),
         };
 
-        // Remove workspace volume and handshake secret.
-        let vol = container::volume_name(sandbox_id);
-        if let Err(e) = self.client.remove_volume(&vol).await {
-            warn!(
-                sandbox_id = %sandbox_id,
-                sandbox_name = %sandbox_name,
-                volume = %vol,
-                error = %e,
-                "Failed to remove workspace volume"
-            );
-        }
-        let sec = container::secret_name(sandbox_id);
-        if let Err(e) = self.client.remove_secret(&sec).await {
-            warn!(
-                sandbox_id = %sandbox_id,
-                sandbox_name = %sandbox_name,
-                secret = %sec,
-                error = %e,
-                "Failed to remove handshake secret"
-            );
+        // Stop and remove proxy sidecar (best-effort).
+        let _ = self.client.stop_container(&proxy_name, 5).await;
+        let _ = self.client.remove_container(&proxy_name).await;
+
+        // Remove volumes, secret, and network (all best-effort, log warnings).
+        for (what, result) in [
+            ("TLS volume", self.client.remove_volume(&tls_vol).await),
+            (
+                "workspace volume",
+                self.client.remove_volume(&workspace_vol).await,
+            ),
+            ("secret", self.client.remove_secret(&sec_name).await),
+            ("network", self.client.remove_network(&internal_net).await),
+        ] {
+            if let Err(e) = result {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    sandbox_name = %sandbox_name,
+                    resource = what,
+                    error = %e,
+                    "Failed to remove {what}"
+                );
+            }
         }
 
-        Ok(container_existed)
+        Ok(agent_existed)
     }
 
     /// Check whether a sandbox container exists.
@@ -444,7 +645,9 @@ impl PodmanComputeDriver {
 
     /// List all managed sandboxes.
     ///
-    /// Only inspects running containers (to get health status). Non-running
+    /// Only returns agent containers (not proxy sidecars). Containers without
+    /// a role label (pre-sidecar containers) are included for backwards compat.
+    /// Running containers are inspected for health check status; non-running
     /// containers are built directly from the list entry data.
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, ComputeDriverError> {
         let entries = self
@@ -452,6 +655,17 @@ impl PodmanComputeDriver {
             .list_containers(LABEL_MANAGED_FILTER)
             .await
             .map_err(ComputeDriverError::from)?;
+
+        // Filter to agent containers only. Containers without a role label
+        // (created before the sidecar architecture) are included.
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|e| {
+                e.labels
+                    .get(LABEL_ROLE)
+                    .map_or(true, |r| r == ROLE_AGENT)
+            })
+            .collect();
 
         let mut sandboxes = Vec::with_capacity(entries.len());
         for entry in &entries {
@@ -751,16 +965,32 @@ mod tests {
     async fn delete_sandbox_cleans_up_with_request_id_when_container_is_already_gone() {
         let sandbox_id = "sandbox-123";
         let sandbox_name = "demo";
-        let container_name = container::container_name(sandbox_name);
-        let volume_name = container::volume_name(sandbox_id);
+        let agent_name = container::container_name(sandbox_name);
+        let proxy_name = container::proxy_container_name(sandbox_name);
+        let tls_vol_name = container::tls_volume_name(sandbox_id);
+        let workspace_vol_name = container::volume_name(sandbox_id);
         let secret_name = container::secret_name(sandbox_id);
+        let internal_net = container::internal_network_name(sandbox_id);
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-not-found",
             vec![
+                // 1. inspect agent → not found
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 2. stop agent → not found
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 3. remove agent → not found
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 4. stop proxy → not found
+                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 5. remove proxy → not found
+                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // 6. remove TLS volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 7. remove workspace volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 8. remove secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 9. remove network
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -782,27 +1012,45 @@ mod tests {
             vec![
                 format!(
                     "GET {}",
-                    api_path(&format!("/libpod/containers/{container_name}/json"))
+                    api_path(&format!("/libpod/containers/{agent_name}/json"))
                 ),
                 format!(
                     "POST {}",
                     api_path(&format!(
-                        "/libpod/containers/{container_name}/stop?timeout=10"
+                        "/libpod/containers/{agent_name}/stop?timeout=10"
                     ))
                 ),
                 format!(
                     "DELETE {}",
                     api_path(&format!(
-                        "/libpod/containers/{container_name}?force=true&v=true"
+                        "/libpod/containers/{agent_name}?force=true&v=true"
+                    ))
+                ),
+                format!(
+                    "POST {}",
+                    api_path(&format!("/libpod/containers/{proxy_name}/stop?timeout=5"))
+                ),
+                format!(
+                    "DELETE {}",
+                    api_path(&format!(
+                        "/libpod/containers/{proxy_name}?force=true&v=true"
                     ))
                 ),
                 format!(
                     "DELETE {}",
-                    api_path(&format!("/libpod/volumes/{volume_name}"))
+                    api_path(&format!("/libpod/volumes/{tls_vol_name}"))
+                ),
+                format!(
+                    "DELETE {}",
+                    api_path(&format!("/libpod/volumes/{workspace_vol_name}"))
                 ),
                 format!(
                     "DELETE {}",
                     api_path(&format!("/libpod/secrets/{secret_name}"))
+                ),
+                format!(
+                    "DELETE {}",
+                    api_path(&format!("/libpod/networks/{internal_net}"))
                 ),
             ]
         );
@@ -813,12 +1061,15 @@ mod tests {
     async fn delete_sandbox_uses_request_id_when_container_label_disagrees() {
         let sandbox_id = "sandbox-request-id";
         let sandbox_name = "demo";
-        let container_name = container::container_name(sandbox_name);
-        let volume_name = container::volume_name(sandbox_id);
+        let agent_name = container::container_name(sandbox_name);
+        let _proxy_name = container::proxy_container_name(sandbox_name);
+        let tls_vol_name = container::tls_volume_name(sandbox_id);
+        let workspace_vol_name = container::volume_name(sandbox_id);
         let secret_name = container::secret_name(sandbox_id);
+        let internal_net = container::internal_network_name(sandbox_id);
         let inspect_body = serde_json::json!({
             "Id": "container-id",
-            "Name": format!("/{container_name}"),
+            "Name": format!("/{agent_name}"),
             "State": {
                 "Status": "running",
                 "Running": true
@@ -833,10 +1084,23 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-mismatch",
             vec![
+                // 1. inspect agent → label mismatch
                 StubResponse::new(StatusCode::OK, inspect_body),
+                // 2. stop agent
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 3. remove agent
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 4. stop proxy
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 5. remove proxy
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 6. remove TLS volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 7. remove workspace volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 8. remove secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // 9. remove network
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -853,16 +1117,25 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
+        // Verify the cleanup resources use the request sandbox_id.
         assert_eq!(
-            requests[3..],
+            requests[5..],
             [
                 format!(
                     "DELETE {}",
-                    api_path(&format!("/libpod/volumes/{volume_name}"))
+                    api_path(&format!("/libpod/volumes/{tls_vol_name}"))
+                ),
+                format!(
+                    "DELETE {}",
+                    api_path(&format!("/libpod/volumes/{workspace_vol_name}"))
                 ),
                 format!(
                     "DELETE {}",
                     api_path(&format!("/libpod/secrets/{secret_name}"))
+                ),
+                format!(
+                    "DELETE {}",
+                    api_path(&format!("/libpod/networks/{internal_net}"))
                 ),
             ]
         );

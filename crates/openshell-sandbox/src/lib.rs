@@ -86,6 +86,7 @@ static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxCon
 pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
     OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
 }
+
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,
@@ -247,6 +248,40 @@ pub async fn run_sandbox(
         }
     }
 
+    // Detect nested mode: the Podman driver sets OPENSHELL_MODE=nested when
+    // the supervisor should provide SSH/exec but skip all security enforcement.
+    let _is_nested = std::env::var("OPENSHELL_MODE").ok().as_deref() == Some("nested");
+
+    // Detect proxy-only mode: the Podman driver sets OPENSHELL_MODE=proxy for
+    // the sidecar container that runs the L7 proxy + TCP port forwarder.
+    let is_proxy_mode = std::env::var("OPENSHELL_MODE").ok().as_deref() == Some("proxy");
+
+    if is_proxy_mode {
+        return run_proxy_mode(
+            sandbox_id,
+            sandbox,
+            openshell_endpoint,
+            policy_rules,
+            policy_data,
+            inference_routes,
+            ocsf_enabled,
+        )
+        .await;
+    }
+
+    // Parse init commands from JSON-encoded env var injected by the driver.
+    // Format: [["git", "clone", "..."], ["/usr/bin/env", "bash", "-c", "..."]]
+    // Malformed JSON is logged and treated as no init commands (safe default).
+    let _init_commands: Vec<Vec<String>> = std::env::var("OPENSHELL_INIT_COMMANDS").map_or_else(
+        |_| vec![],
+        |s| {
+            serde_json::from_str(&s).unwrap_or_else(|e| {
+                warn!("Failed to parse OPENSHELL_INIT_COMMANDS, skipping init commands: {e}");
+                vec![]
+            })
+        },
+    );
+
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
@@ -304,12 +339,38 @@ pub async fn run_sandbox(
     let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
     let secret_resolver = secret_resolver.map(Arc::new);
 
+    // Detect sidecar proxy mode early — it affects TLS and network setup.
+    // The Podman driver sets OPENSHELL_PROXY_MODE=sidecar when network isolation
+    // is handled by the container topology (--internal network) rather than
+    // inner network namespaces.
+    let is_sidecar = std::env::var("OPENSHELL_PROXY_MODE").ok().as_deref() == Some("sidecar");
+
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
     // The CA cert is written to disk so sandbox processes can trust it.
-    let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    //
+    // In sidecar mode, the proxy sidecar generates the CA and writes it to
+    // the shared /openshell-tls/ volume. The agent just needs to point tools
+    // at those files — no CA generation needed.
+    let (tls_state, ca_file_paths) = if is_sidecar {
+        // Proxy's CA files are at /openshell-tls/ (shared volume, mounted ro).
+        let tls_dir = std::path::Path::new("/openshell-tls");
+        let ca_cert = tls_dir.join("openshell-ca.pem");
+        let ca_bundle = tls_dir.join("ca-bundle.pem");
+        if ca_cert.exists() && ca_bundle.exists() {
+            info!("Sidecar mode: using proxy CA from shared volume");
+            (None, Some((ca_cert, ca_bundle)))
+        } else {
+            warn!(
+                "Sidecar mode: proxy CA files not found at {}. \
+                 HTTPS verification will fail until proxy writes them.",
+                tls_dir.display()
+            );
+            (None, None)
+        }
+    } else if matches!(policy.network.mode, NetworkMode::Proxy) {
         match SandboxCa::generate() {
             Ok(ca) => {
                 let tls_dir = std::path::Path::new("/etc/openshell-tls");
@@ -369,8 +430,9 @@ pub async fn run_sandbox(
     // Create network namespace for proxy mode (Linux only)
     // This must be created before the proxy AND SSH server so that SSH
     // sessions can enter the namespace for network isolation.
+    // Skip when running in sidecar mode — the container topology handles isolation.
     #[cfg(target_os = "linux")]
-    let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    let netns = if matches!(policy.network.mode, NetworkMode::Proxy) && !is_sidecar {
         match NetworkNamespace::create() {
             Ok(ns) => {
                 // Install bypass detection rules (iptables LOG + REJECT).
@@ -423,6 +485,7 @@ pub async fn run_sandbox(
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
     let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
+        && !is_sidecar
     {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
@@ -505,7 +568,11 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     let ssh_netns_fd: Option<i32> = None;
 
-    let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    let ssh_proxy_url = if is_sidecar {
+        // In sidecar mode, proxy URL comes from the container's HTTP_PROXY env
+        // (set by the Podman driver to point at the sidecar proxy container).
+        std::env::var("HTTP_PROXY").ok()
+    } else if matches!(policy.network.mode, NetworkMode::Proxy) {
         #[cfg(target_os = "linux")]
         {
             netns.as_ref().map(|ns| {
@@ -2375,6 +2442,235 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
         Some(setting_value::Value::IntValue(v)) => v.to_string(),
         Some(setting_value::Value::BytesValue(_)) => "<bytes>".to_string(),
     }
+}
+
+/// Run in proxy-only mode (sidecar container).
+///
+/// This mode runs the L7 proxy, OPA engine, credential injection, inference
+/// routing, and a TCP port-forwarder for gateway gRPC. It does NOT start
+/// SSH, spawn workloads, or apply inner sandboxing.
+///
+/// The proxy writes a `.ready` sentinel to `/openshell-tls/` after both
+/// listeners (proxy on :3128, TCP forwarder on :8081) are bound.
+#[allow(clippy::too_many_arguments)]
+async fn run_proxy_mode(
+    sandbox_id: Option<String>,
+    sandbox: Option<String>,
+    openshell_endpoint: Option<String>,
+    policy_rules: Option<String>,
+    policy_data: Option<String>,
+    inference_routes: Option<String>,
+    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<i32> {
+    info!("Proxy-only mode: starting L7 proxy + TCP port forwarder");
+
+    // Load policy and OPA engine (same as normal mode).
+    let (policy, opa_engine, _retained_proto) = load_policy(
+        sandbox_id.clone(),
+        sandbox.clone(),
+        openshell_endpoint.clone(),
+        policy_rules,
+        policy_data,
+    )
+    .await?;
+
+    // Fetch provider env and build SecretResolver.
+    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+        match grpc_client::fetch_provider_environment(endpoint, id).await {
+            Ok(env) => env,
+            Err(e) => {
+                warn!("Failed to fetch provider environment in proxy mode: {e}");
+                std::collections::HashMap::new()
+            }
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
+    let (_provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    let secret_resolver = secret_resolver.map(Arc::new);
+
+    // TLS state: generate or load CA, write to /openshell-tls/.
+    let tls_dir = std::path::Path::new("/openshell-tls");
+    let tls_state = match SandboxCa::generate() {
+        Ok(ca) => {
+            let system_ca_bundle = read_system_ca_bundle();
+            // Write CA files to the TLS volume (shared with agent container).
+            match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
+                Ok(_paths) => {
+                    let upstream_config = build_upstream_client_config(&system_ca_bundle);
+                    let cert_cache = CertCache::new(ca);
+                    Some(Arc::new(ProxyTlsState::new(cert_cache, upstream_config)))
+                }
+                Err(e) => {
+                    warn!("Failed to write CA files in proxy mode: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to generate CA in proxy mode: {e}");
+            None
+        }
+    };
+
+    // Build inference context.
+    let inference_ctx = build_inference_context(
+        sandbox_id.as_deref(),
+        openshell_endpoint.as_deref(),
+        inference_routes.as_deref(),
+    )
+    .await?;
+
+    // Create denial aggregator channel.
+    let (denial_tx, denial_rx) = if sandbox_id.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // Start L7 proxy on 0.0.0.0:3128.
+    let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
+        miette::miette!("Proxy mode requires proxy configuration in policy")
+    })?;
+    let engine = opa_engine.clone().ok_or_else(|| {
+        miette::miette!("Proxy mode requires an OPA engine")
+    })?;
+
+    let entrypoint_pid = Arc::new(AtomicU32::new(0));
+    let proxy_bind = SocketAddr::from(([0, 0, 0, 0], 3128));
+    let _proxy = ProxyHandle::start_with_bind_addr(
+        proxy_policy,
+        Some(proxy_bind),
+        engine,
+        entrypoint_pid,
+        tls_state,
+        inference_ctx,
+        secret_resolver,
+        denial_tx,
+    )
+    .await?;
+
+    info!("L7 proxy listening on {proxy_bind}");
+
+    // Start TCP port-forwarder: 0.0.0.0:8081 → gateway gRPC endpoint.
+    let gw_endpoint = openshell_endpoint.as_deref().ok_or_else(|| {
+        miette::miette!("Proxy mode requires OPENSHELL_ENDPOINT for TCP port forwarding")
+    })?;
+    let fwd_listen = SocketAddr::from(([0, 0, 0, 0], 8081));
+    let upstream_url: url::Url = gw_endpoint
+        .parse()
+        .map_err(|e| miette::miette!("Invalid OPENSHELL_ENDPOINT URL: {e}"))?;
+    let upstream_host = upstream_url
+        .host_str()
+        .ok_or_else(|| miette::miette!("OPENSHELL_ENDPOINT has no host"))?;
+    let upstream_port = upstream_url
+        .port_or_known_default()
+        .ok_or_else(|| miette::miette!("OPENSHELL_ENDPOINT has no port"))?;
+    let upstream_addr = format!("{upstream_host}:{upstream_port}");
+
+    let fwd_listener = tokio::net::TcpListener::bind(fwd_listen)
+        .await
+        .into_diagnostic()?;
+    info!("TCP port forwarder listening on {fwd_listen} -> {upstream_addr}");
+
+    let upstream_for_task = upstream_addr.clone();
+    tokio::spawn(async move {
+        loop {
+            match fwd_listener.accept().await {
+                Ok((client, _)) => {
+                    let upstream = upstream_for_task.clone();
+                    tokio::spawn(async move {
+                        match tokio::net::TcpStream::connect(&upstream).await {
+                            Ok(server) => {
+                                let (mut cr, mut cw) = tokio::io::split(client);
+                                let (mut sr, mut sw) = tokio::io::split(server);
+                                tokio::select! {
+                                    _ = tokio::io::copy(&mut cr, &mut sw) => {},
+                                    _ = tokio::io::copy(&mut sr, &mut cw) => {},
+                                }
+                            }
+                            Err(e) => {
+                                debug!("TCP forwarder upstream connect failed: {e}");
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("TCP forwarder accept failed: {e}");
+                }
+            }
+        }
+    });
+
+    // Write .ready sentinel to signal the driver that the proxy is up.
+    let ready_path = tls_dir.join(".ready");
+    if let Err(e) = tokio::fs::write(&ready_path, "ready\n").await {
+        warn!("Failed to write .ready sentinel: {e}");
+    } else {
+        info!("Wrote .ready sentinel to {}", ready_path.display());
+    }
+
+    // Spawn policy poll loop (same as normal mode).
+    if let (Some(id), Some(endpoint), Some(engine)) =
+        (&sandbox_id, &openshell_endpoint, &opa_engine)
+    {
+        let poll_id = id.clone();
+        let poll_endpoint = endpoint.clone();
+        let poll_engine = engine.clone();
+        let poll_ocsf_enabled = ocsf_enabled;
+        let poll_pid = Arc::new(AtomicU32::new(0));
+        let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        tokio::spawn(async move {
+            if let Err(e) = run_policy_poll_loop(
+                &poll_endpoint,
+                &poll_id,
+                &poll_engine,
+                &poll_pid,
+                poll_interval_secs,
+                &poll_ocsf_enabled,
+            )
+            .await
+            {
+                warn!("Policy poll loop exited: {e}");
+            }
+        });
+    }
+
+    // Spawn denial aggregator.
+    if let (Some(rx), Some(id), Some(endpoint)) = (denial_rx, &sandbox_id, &openshell_endpoint) {
+        let agg_name = sandbox.unwrap_or_else(|| id.clone());
+        let agg_endpoint = endpoint.clone();
+        let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+        tokio::spawn(async move {
+            aggregator
+                .run(|summaries| {
+                    let endpoint = agg_endpoint.clone();
+                    let sandbox_name = agg_name.clone();
+                    async move {
+                        if let Err(e) =
+                            flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries).await
+                        {
+                            warn!(error = %e, "Failed to flush denial summaries");
+                        }
+                    }
+                })
+                .await;
+        });
+    }
+
+    // Wait forever — the proxy runs until the container is stopped.
+    info!("Proxy mode ready, waiting for shutdown");
+    std::future::pending::<()>().await;
+    Ok(0)
 }
 
 #[cfg(test)]

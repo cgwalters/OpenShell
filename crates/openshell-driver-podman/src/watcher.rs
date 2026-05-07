@@ -7,7 +7,7 @@ use crate::client::{
     ContainerInspect, ContainerListEntry, ContainerState, HealthState, PodmanApiError,
     PodmanClient, PodmanEvent,
 };
-use crate::container::{LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, short_id};
+use crate::container::{LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_ROLE, ROLE_PROXY, short_id};
 use futures::Stream;
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::{
@@ -79,6 +79,11 @@ pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiE
     let existing = client.list_containers(LABEL_MANAGED_FILTER).await?;
 
     for entry in &existing {
+        // Skip proxy sidecar containers.
+        if entry.labels.get(LABEL_ROLE).is_some_and(|r| r == ROLE_PROXY) {
+            continue;
+        }
+
         // For running containers, use inspect to get full state including
         // health check status — matching the same condition derivation used
         // for live events.
@@ -164,6 +169,12 @@ async fn map_podman_event(
     event: &PodmanEvent,
     client: &PodmanClient,
 ) -> Option<WatchSandboxesEvent> {
+    // Skip events for proxy sidecar containers.
+    if event.actor.attributes.get(LABEL_ROLE).is_some_and(|r| r == ROLE_PROXY) {
+        debug!(action = %event.action, "Ignoring event for proxy sidecar container");
+        return None;
+    }
+
     let container_id = &event.actor.id;
     let sandbox_id = event
         .actor
@@ -270,6 +281,11 @@ fn build_driver_sandbox(
 
 /// Build a `DriverSandbox` from a container inspection result.
 pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverSandbox> {
+    // Skip proxy sidecar containers — only agent containers are exposed as sandboxes.
+    if inspect.config.labels.get(LABEL_ROLE).is_some_and(|r| r == ROLE_PROXY) {
+        return None;
+    }
+
     let sandbox_id = inspect.config.labels.get(LABEL_SANDBOX_ID)?.clone();
     let sandbox_name = inspect
         .config
@@ -293,6 +309,11 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
 
 /// Build a `DriverSandbox` from a container list entry (no inspect needed).
 pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<DriverSandbox> {
+    // Skip proxy sidecar containers.
+    if entry.labels.get(LABEL_ROLE).is_some_and(|r| r == ROLE_PROXY) {
+        return None;
+    }
+
     let sandbox_id = entry.labels.get(LABEL_SANDBOX_ID)?.clone();
     let sandbox_name = entry
         .labels
@@ -545,5 +566,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn proxy_container_filtered_from_list_entry() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(LABEL_SANDBOX_ID.to_string(), "test-id".to_string());
+        labels.insert(LABEL_SANDBOX_NAME.to_string(), "test-name".to_string());
+        labels.insert(LABEL_ROLE.to_string(), ROLE_PROXY.to_string());
+
+        let entry = ContainerListEntry {
+            id: "proxy-container-id".to_string(),
+            names: vec!["openshell-proxy-test-name".to_string()],
+            state: "running".to_string(),
+            labels,
+            ports: None,
+            networks: None,
+            exit_code: 0,
+        };
+
+        assert!(
+            driver_sandbox_from_list_entry(&entry).is_none(),
+            "proxy containers should be filtered out"
+        );
+    }
+
+    #[test]
+    fn agent_container_not_filtered_from_list_entry() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(LABEL_SANDBOX_ID.to_string(), "test-id".to_string());
+        labels.insert(LABEL_SANDBOX_NAME.to_string(), "test-name".to_string());
+        labels.insert(LABEL_ROLE.to_string(), "agent".to_string());
+
+        let entry = ContainerListEntry {
+            id: "agent-container-id".to_string(),
+            names: vec!["openshell-sandbox-test-name".to_string()],
+            state: "running".to_string(),
+            labels,
+            ports: None,
+            networks: None,
+            exit_code: 0,
+        };
+
+        let sandbox = driver_sandbox_from_list_entry(&entry);
+        assert!(
+            sandbox.is_some(),
+            "agent containers should not be filtered out"
+        );
+    }
+
+    #[test]
+    fn container_without_role_label_not_filtered() {
+        // Pre-existing containers without the role label should still be included
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(LABEL_SANDBOX_ID.to_string(), "old-id".to_string());
+        labels.insert(LABEL_SANDBOX_NAME.to_string(), "old-name".to_string());
+        // No LABEL_ROLE
+
+        let entry = ContainerListEntry {
+            id: "old-container-id".to_string(),
+            names: vec!["openshell-sandbox-old-name".to_string()],
+            state: "running".to_string(),
+            labels,
+            ports: None,
+            networks: None,
+            exit_code: 0,
+        };
+
+        let sandbox = driver_sandbox_from_list_entry(&entry);
+        assert!(
+            sandbox.is_some(),
+            "containers without role label should still be included"
+        );
     }
 }
