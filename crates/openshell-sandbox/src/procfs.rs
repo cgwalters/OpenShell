@@ -47,6 +47,8 @@ struct DescendantPid {
     depth: usize,
 }
 
+
+
 /// Read the binary path of a process via `/proc/{pid}/exe` symlink.
 ///
 /// Returns the canonical path to the executable that the process is running.
@@ -111,63 +113,6 @@ pub fn binary_path(pid: i32) -> Result<PathBuf> {
     }
 
     Ok(target)
-}
-
-/// Resolve the binary path of the TCP peer inside a sandbox network namespace.
-///
-/// Uses `/proc/<entrypoint_pid>/net/tcp` to find the socket inode for the given
-/// ephemeral port, then scans the entrypoint process tree to find which PID owns
-/// that socket, and finally reads `/proc/<pid>/exe` to get the binary path.
-#[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<PathBuf> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
-    binary_path(owner.pid.cast_signed())
-}
-
-/// Resolve all process owners for the TCP peer inside a sandbox network namespace.
-///
-/// Multiple processes can legitimately hold the same socket inode after `fork()`
-/// or fd passing. Callers that make security decisions must evaluate the full
-/// owner set instead of selecting the first PID returned by `/proc` traversal.
-#[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_socket_owners(
-    entrypoint_pid: u32,
-    peer_port: u16,
-) -> Result<TcpPeerSocketOwners> {
-    let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
-    let owners = find_socket_inode_owners(inode, entrypoint_pid)?;
-    Ok(TcpPeerSocketOwners { inode, owners })
-}
-
-/// Resolve exactly one owner for the TCP peer, failing closed on ambiguity.
-#[cfg(target_os = "linux")]
-fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<SocketOwner> {
-    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)?;
-    match socket_owners.owners.as_slice() {
-        [owner] => Ok(owner.clone()),
-        owners => {
-            let mut pids: Vec<u32> = owners.iter().map(|owner| owner.pid).collect();
-            pids.sort_unstable();
-            Err(miette::miette!(
-                "Ambiguous socket ownership for inode {}: PIDs [{}] all hold the same socket",
-                socket_owners.inode,
-                pids.iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        }
-    }
-}
-
-/// Like `resolve_tcp_peer_binary`, but also returns the PID that owns the socket.
-///
-/// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` `PPid` chain.
-#[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
-    let path = binary_path(owner.pid.cast_signed())?;
-    Ok((path, owner.pid))
 }
 
 /// Read the `PPid` (parent PID) from `/proc/<pid>/status`.
@@ -273,23 +218,30 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
     paths
 }
 
+
+
+/// Resolve all process owners for the TCP peer inside a sandbox network namespace.
+///
+/// Multiple processes can legitimately hold the same socket inode after `fork()`
+/// or fd passing. Callers that make security decisions must evaluate the full
+/// owner set instead of selecting the first PID returned by `/proc` traversal.
+#[cfg(target_os = "linux")]
+pub fn resolve_tcp_peer_socket_owners(
+    entrypoint_pid: u32,
+    peer_port: u16,
+) -> Result<TcpPeerSocketOwners> {
+    let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
+    let owners = find_socket_inode_owners(inode, entrypoint_pid)?;
+    Ok(TcpPeerSocketOwners { inode, owners })
+}
+
 /// Parse `/proc/<pid>/net/tcp` (and `/proc/<pid>/net/tcp6`) to find the socket
 /// inode for a given local port.
 ///
 /// Checks both IPv4 and IPv6 tables because some clients (notably gRPC C-core)
 /// use `AF_INET6` sockets with IPv4-mapped addresses even for IPv4 connections.
-///
-/// Format of `/proc/net/tcp`:
-/// ```text
-///   sl  local_address rem_address   st tx_queue:rx_queue ... inode
-///    0: 0200C80A:8F4C 0100C80A:0C38 01 00000000:00000000 ... 12345
-/// ```
-/// - Addresses: hex IP (host byte order) `:` hex port
-/// - State `01` = ESTABLISHED
-/// - Inode is field index 9 (0-indexed)
 #[cfg(target_os = "linux")]
 fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
-    // Check IPv4 first (most common), then IPv6.
     for suffix in &["tcp", "tcp6"] {
         let path = format!("/proc/{pid}/net/{suffix}");
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -302,16 +254,12 @@ fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
                 continue;
             }
 
-            // Parse local_address to extract port.
-            // IPv4 format: AABBCCDD:PORT
-            // IPv6 format: 00000000000000000000000000000000:PORT
             let local_addr = fields[1];
             let local_port = match local_addr.rsplit_once(':') {
                 Some((_, port_hex)) => u16::from_str_radix(port_hex, 16).unwrap_or(0),
                 None => continue,
             };
 
-            // Check state is ESTABLISHED (01)
             let state = fields[3];
             if state != "01" {
                 continue;
@@ -337,17 +285,12 @@ fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
 }
 
 /// Scan `/proc` to find every PID that owns a given socket inode.
-///
-/// First scans descendants of `entrypoint_pid` (most likely owners), then falls
-/// back to scanning all of `/proc`. Requires `CAP_SYS_PTRACE` to read
-/// `/proc/<pid>/fd/` for processes running as a different user.
 #[cfg(target_os = "linux")]
 fn find_socket_inode_owners(inode: u64, entrypoint_pid: u32) -> Result<Vec<SocketOwner>> {
     let target = format!("socket:[{inode}]");
     let mut owners = Vec::new();
     let mut checked = HashSet::new();
 
-    // First: scan descendants of the entrypoint process
     let descendants = collect_descendant_pids_with_depth(entrypoint_pid);
 
     for descendant in &descendants {
@@ -362,7 +305,6 @@ fn find_socket_inode_owners(inode: u64, entrypoint_pid: u32) -> Result<Vec<Socke
         }
     }
 
-    // Fallback: scan all of /proc in case the process isn't in the tree
     if let Ok(proc_dir) = std::fs::read_dir("/proc") {
         let mut proc_pids = Vec::new();
         for entry in proc_dir.flatten() {
@@ -420,9 +362,6 @@ fn check_pid_fds(pid: u32, target: &str) -> bool {
 }
 
 /// Collect all descendant PIDs of a root process using `/proc/<pid>/task/<tid>/children`.
-///
-/// Performs a BFS walk of the process tree. If `/proc/<pid>/task/<tid>/children`
-/// is not available (requires `CONFIG_PROC_CHILDREN`), returns only the root PID.
 #[cfg(all(test, target_os = "linux"))]
 fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     collect_descendant_pids_with_depth(root_pid)
@@ -738,6 +677,8 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
     }
+
+
 
     #[cfg(target_os = "linux")]
     #[test]

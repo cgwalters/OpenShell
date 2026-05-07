@@ -1033,7 +1033,6 @@ where
 mod tests {
     use super::*;
     use crate::opa::{NetworkInput, OpaEngine};
-    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
@@ -1109,10 +1108,6 @@ network_policies:
         let input = NetworkInput {
             host: "api.example.test".into(),
             port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
         };
         let (endpoint_config, generation) = engine
             .query_endpoint_config_with_generation(&input)

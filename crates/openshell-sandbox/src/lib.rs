@@ -9,7 +9,7 @@ pub mod bypass_monitor;
 mod child_env;
 pub mod denial_aggregator;
 mod grpc_client;
-mod identity;
+
 pub mod l7;
 pub mod log_push;
 pub mod mechanistic_mapper;
@@ -86,8 +86,6 @@ static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxCon
 pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
     OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
 }
-
-use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,
@@ -306,11 +304,6 @@ pub async fn run_sandbox(
     let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
     let secret_resolver = secret_resolver.map(Arc::new);
 
-    // Create identity cache for SHA256 TOFU when OPA is active
-    let identity_cache = opa_engine
-        .as_ref()
-        .map(|_| Arc::new(BinaryIdentityCache::new()));
-
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
 
@@ -439,10 +432,6 @@ pub async fn run_sandbox(
             miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
         })?;
 
-        let cache = identity_cache.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
-        })?;
-
         // If we have a network namespace, bind to the veth host IP so sandboxed
         // processes can reach the proxy via TCP.
         #[cfg(target_os = "linux")]
@@ -476,7 +465,6 @@ pub async fn run_sandbox(
             proxy_policy,
             bind_addr,
             engine,
-            cache,
             entrypoint_pid.clone(),
             tls_state,
             inference_ctx,

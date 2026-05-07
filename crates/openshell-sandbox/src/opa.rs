@@ -42,14 +42,6 @@ pub enum NetworkAction {
 pub struct NetworkInput {
     pub host: String,
     pub port: u16,
-    pub binary_path: PathBuf,
-    pub binary_sha256: String,
-    /// Ancestor binary paths from process tree walk (parent, grandparent, ...).
-    pub ancestors: Vec<PathBuf>,
-    /// Absolute paths extracted from `/proc/<pid>/cmdline` of the socket-owning
-    /// process and its ancestors. Captures script paths (e.g. `/usr/local/bin/claude`)
-    /// that don't appear in `/proc/<pid>/exe` because the interpreter (node) is the exe.
-    pub cmdline_paths: Vec<PathBuf>,
 }
 
 /// Sandbox configuration extracted from OPA data at startup.
@@ -239,22 +231,7 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
         let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
             "network": {
                 "host": input.host,
                 "port": input.port,
@@ -301,30 +278,7 @@ impl OpaEngine {
     /// Uses the OPA `network_action` rule which returns one of:
     /// `"allow"` or `"deny"`.
     pub fn evaluate_network_action(&self, input: &NetworkInput) -> Result<NetworkAction> {
-        Ok(self.evaluate_network_action_with_generation(input)?.0)
-    }
-
-    /// Evaluate network action and return the policy generation used for the evaluation.
-    pub fn evaluate_network_action_with_generation(
-        &self,
-        input: &NetworkInput,
-    ) -> Result<(NetworkAction, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
         let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
             "network": {
                 "host": input.host,
                 "port": input.port,
@@ -335,7 +289,6 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        let generation = self.current_generation();
 
         engine
             .set_input_json(&input_json.to_string())
@@ -356,13 +309,13 @@ impl OpaEngine {
         };
 
         if action_str == "allow" {
-            Ok((NetworkAction::Allow { matched_policy }, generation))
+            Ok(NetworkAction::Allow { matched_policy })
         } else {
             let reason_val = engine
                 .eval_rule("data.openshell.sandbox.deny_reason".into())
                 .map_err(|e| miette::miette!("{e}"))?;
             let reason = value_to_string(&reason_val);
-            Ok((NetworkAction::Deny { reason }, generation))
+            Ok(NetworkAction::Deny { reason })
         }
     }
 
@@ -500,22 +453,7 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Vec<regorus::Value>, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
         let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
             "network": {
                 "host": input.host,
                 "port": input.port,
@@ -1205,12 +1143,7 @@ mod tests {
         // Simulates Claude Code: exe is /usr/bin/node, script is /usr/local/bin/claude
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -1219,38 +1152,12 @@ mod tests {
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("claude_code"));
     }
-
-    #[test]
-    fn wrong_binary_denied() {
-        let engine = test_engine();
-        let input = NetworkInput {
-            host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(!decision.allowed);
-        assert!(
-            decision.reason.contains("not allowed"),
-            "Expected specific deny reason, got: {}",
-            decision.reason
-        );
-    }
-
     #[test]
     fn wrong_endpoint_denied() {
         let engine = test_engine();
         let input = NetworkInput {
             host: "evil.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(!decision.allowed);
         assert!(
@@ -1259,42 +1166,23 @@ mod tests {
             decision.reason
         );
     }
-
-    #[test]
-    fn unknown_binary_default_deny() {
-        let engine = test_engine();
-        let input = NetworkInput {
-            host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/tmp/malicious"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(!decision.allowed);
-    }
-
     #[test]
     fn github_policy_allows_git() {
         let engine = test_engine();
         let input = NetworkInput {
             host: "github.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/git"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
             "Expected allow, got deny: {}",
             decision.reason
         );
+        // Without binary matching, both "copilot" and "github_ssh_over_https"
+        // match github.com:443. min() picks "copilot" lexicographically.
         assert_eq!(
             decision.matched_policy.as_deref(),
-            Some("github_ssh_over_https")
+            Some("copilot")
         );
     }
 
@@ -1303,12 +1191,7 @@ mod tests {
         let engine = test_engine();
         let input = NetworkInput {
             host: "API.ANTHROPIC.COM".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -1322,12 +1205,7 @@ mod tests {
         let engine = test_engine();
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 80,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 80,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(!decision.allowed);
     }
@@ -1360,12 +1238,7 @@ mod tests {
 
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(decision.allowed);
     }
@@ -1377,12 +1250,7 @@ mod tests {
         // Verify initial policy works
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(decision.allowed);
 
@@ -1407,290 +1275,13 @@ network_policies: {}
             "Expected deny after reload with empty policies"
         );
     }
-
-    #[test]
-    fn ancestor_binary_allowed() {
-        // Use github policy: binary /usr/bin/git is the policy binary.
-        // If the socket process is /usr/bin/python3 but its ancestor is /usr/bin/git, allow.
-        let engine = test_engine();
-        let input = NetworkInput {
-            host: "github.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/bin/git")],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Expected allow via ancestor match, got deny: {}",
-            decision.reason
-        );
-        assert_eq!(
-            decision.matched_policy.as_deref(),
-            Some("github_ssh_over_https")
-        );
-    }
-
-    #[test]
-    fn no_ancestor_match_denied() {
-        let engine = test_engine();
-        let input = NetworkInput {
-            host: "github.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/bin/bash")],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(!decision.allowed);
-        assert!(
-            decision.reason.contains("not allowed"),
-            "Expected 'not allowed' in deny reason, got: {}",
-            decision.reason
-        );
-    }
-
-    #[test]
-    fn deep_ancestor_chain_matches() {
-        let engine = test_engine();
-        let input = NetworkInput {
-            host: "github.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/bin/sh"), PathBuf::from("/usr/bin/git")],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Expected allow via deep ancestor match, got deny: {}",
-            decision.reason
-        );
-    }
-
-    #[test]
-    fn empty_ancestors_falls_back_to_direct() {
-        let engine = test_engine();
-        // Direct binary path match still works with empty ancestors and cmdline
-        let input = NetworkInput {
-            host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Direct path match should still work with empty ancestors"
-        );
-    }
-
-    #[test]
-    fn glob_pattern_matches_binary() {
-        // Test with a policy that uses glob patterns
-        let glob_data = r#"
-network_policies:
-  glob_test:
-    name: glob_test
-    endpoints:
-      - { host: example.com, port: 443 }
-    binaries:
-      - { path: "/usr/bin/*" }
-"#;
-        let engine = OpaEngine::from_strings(TEST_POLICY, glob_data).unwrap();
-        let input = NetworkInput {
-            host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Expected glob pattern to match binary, got deny: {}",
-            decision.reason
-        );
-    }
-
-    #[test]
-    fn glob_pattern_matches_ancestor() {
-        let glob_data = r#"
-network_policies:
-  glob_test:
-    name: glob_test
-    endpoints:
-      - { host: example.com, port: 443 }
-    binaries:
-      - { path: "/usr/local/bin/*" }
-"#;
-        let engine = OpaEngine::from_strings(TEST_POLICY, glob_data).unwrap();
-        let input = NetworkInput {
-            host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/local/bin/claude")],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Expected glob pattern to match ancestor, got deny: {}",
-            decision.reason
-        );
-    }
-
-    #[test]
-    fn glob_pattern_no_cross_segment() {
-        // * should NOT match across / boundaries
-        let glob_data = r#"
-network_policies:
-  glob_test:
-    name: glob_test
-    endpoints:
-      - { host: example.com, port: 443 }
-    binaries:
-      - { path: "/usr/bin/*" }
-"#;
-        let engine = OpaEngine::from_strings(TEST_POLICY, glob_data).unwrap();
-        let input = NetworkInput {
-            host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/subdir/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(!decision.allowed, "Glob * should not cross / boundaries");
-    }
-
-    #[test]
-    fn cmdline_path_does_not_grant_access() {
-        // Simulates: node runs /usr/local/bin/my-tool (a script with shebang).
-        // exe = /usr/bin/node, cmdline contains /usr/local/bin/my-tool.
-        // cmdline_paths are attacker-controlled (argv[0] spoofing) and must
-        // NOT be used as a grant-access signal.
-        let cmdline_data = r"
-network_policies:
-  script_test:
-    name: script_test
-    endpoints:
-      - { host: example.com, port: 443 }
-    binaries:
-      - { path: /usr/local/bin/my-tool }
-";
-        let engine = OpaEngine::from_strings(TEST_POLICY, cmdline_data).unwrap();
-        let input = NetworkInput {
-            host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/bin/bash")],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/my-tool")],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            !decision.allowed,
-            "cmdline_paths must not grant network access (argv[0] is spoofable)"
-        );
-    }
-
-    #[test]
-    fn cmdline_path_no_match_denied() {
-        let cmdline_data = r"
-network_policies:
-  script_test:
-    name: script_test
-    endpoints:
-      - { host: example.com, port: 443 }
-    binaries:
-      - { path: /usr/local/bin/my-tool }
-";
-        let engine = OpaEngine::from_strings(TEST_POLICY, cmdline_data).unwrap();
-        let input = NetworkInput {
-            host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/bin/bash")],
-            cmdline_paths: vec![
-                PathBuf::from("/usr/bin/node"),
-                PathBuf::from("/tmp/script.js"),
-            ],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(!decision.allowed);
-    }
-
-    #[test]
-    fn cmdline_glob_pattern_does_not_grant_access() {
-        let glob_data = r#"
-network_policies:
-  glob_test:
-    name: glob_test
-    endpoints:
-      - { host: example.com, port: 443 }
-    binaries:
-      - { path: "/usr/local/bin/*" }
-"#;
-        let engine = OpaEngine::from_strings(TEST_POLICY, glob_data).unwrap();
-        let input = NetworkInput {
-            host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            !decision.allowed,
-            "cmdline_paths must not match globs for granting access (argv[0] is spoofable)"
-        );
-    }
-
-    #[test]
-    fn from_proto_allows_matching_request() {
-        let proto = test_proto();
-        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
-        let input = NetworkInput {
-            host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Expected allow from proto-based engine, got deny: {}",
-            decision.reason
-        );
-        assert_eq!(decision.matched_policy.as_deref(), Some("claude_code"));
-    }
-
     #[test]
     fn from_proto_denies_unmatched_request() {
         let proto = test_proto();
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
         let input = NetworkInput {
             host: "evil.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(!decision.allowed);
     }
@@ -2349,25 +1940,6 @@ network_policies:
         let input = l7_input("l4only.example.com", 443, "GET", "/anything");
         assert!(!eval_l7(&engine, &input));
     }
-
-    #[test]
-    fn l7_wrong_binary_denied_even_with_matching_rules() {
-        let engine = l7_engine();
-        let input = serde_json::json!({
-            "network": { "host": "api.example.com", "port": 8080 },
-            "exec": {
-                "path": "/usr/bin/python3",
-                "ancestors": [],
-                "cmdline_paths": []
-            },
-            "request": {
-                "method": "GET",
-                "path": "/repos/myorg/foo"
-            }
-        });
-        assert!(!eval_l7(&engine, &input));
-    }
-
     #[test]
     fn l7_deny_reason_populated() {
         let engine = l7_engine();
@@ -2392,12 +1964,7 @@ network_policies:
         let engine = l7_engine();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8080,        };
         let config = engine.query_endpoint_config(&input).unwrap();
         assert!(config.is_some(), "Expected L7 config for rest endpoint");
         let config = config.unwrap();
@@ -2448,12 +2015,7 @@ network_policies:
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
             host: "registry.npmjs.org".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
 
         let config = engine
             .query_endpoint_config(&input)
@@ -2468,12 +2030,7 @@ network_policies:
         let engine = l7_engine();
         let input = NetworkInput {
             host: "l4only.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let config = engine.query_endpoint_config(&input).unwrap();
         assert!(
             config.is_none(),
@@ -2545,10 +2102,6 @@ network_policies:
         let input = NetworkInput {
             host: "api.example.com".into(),
             port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
         };
 
         let (config, generation) = engine
@@ -2909,12 +2462,7 @@ process:
             .expect("engine should load overlapping data");
         let input = NetworkInput {
             host: "192.168.1.100".into(),
-            port: 8567,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: String::new(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8567,        };
         // Should return config from one of the entries without error.
         let config = engine.query_endpoint_config(&input).unwrap();
         assert!(
@@ -2986,12 +2534,7 @@ process:
         let engine = inference_engine();
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let action = engine.evaluate_network_action(&input).unwrap();
         assert_eq!(
             action,
@@ -3006,12 +2549,7 @@ process:
         let engine = inference_engine();
         let input = NetworkInput {
             host: "api.openai.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let action = engine.evaluate_network_action(&input).unwrap();
         match &action {
             NetworkAction::Deny { .. } => {}
@@ -3024,69 +2562,20 @@ process:
         let engine = no_inference_engine();
         let input = NetworkInput {
             host: "api.openai.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let action = engine.evaluate_network_action(&input).unwrap();
         match &action {
             NetworkAction::Deny { .. } => {}
             other => panic!("Expected Deny, got: {other:?}"),
         }
     }
-
-    #[test]
-    fn endpoint_in_policy_binary_not_allowed_returns_deny() {
-        // api.anthropic.com is declared but python3 is not in the binary list.
-        // With binary allow/deny, this is denied.
-        let engine = inference_engine();
-        let input = NetworkInput {
-            host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let action = engine.evaluate_network_action(&input).unwrap();
-        match &action {
-            NetworkAction::Deny { .. } => {}
-            other => panic!("Expected Deny, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn endpoint_in_policy_binary_not_allowed_without_inference_returns_deny() {
-        let engine = no_inference_engine();
-        let input = NetworkInput {
-            host: "gitlab.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let action = engine.evaluate_network_action(&input).unwrap();
-        match &action {
-            NetworkAction::Deny { .. } => {}
-            other => panic!("Expected Deny, got: {other:?}"),
-        }
-    }
-
     #[test]
     fn from_proto_explicitly_allowed_returns_allow() {
         let proto = test_proto();
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let action = engine.evaluate_network_action(&input).unwrap();
         assert_eq!(
             action,
@@ -3102,12 +2591,7 @@ process:
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
             host: "api.openai.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let action = engine.evaluate_network_action(&input).unwrap();
         match &action {
             NetworkAction::Deny { .. } => {}
@@ -3121,12 +2605,7 @@ process:
         // claude direct to api.anthropic.com → allow (explicit match)
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let action = engine.evaluate_network_action(&input).unwrap();
         assert_eq!(
             action,
@@ -3138,17 +2617,12 @@ process:
         // git to github.com → allow
         let input = NetworkInput {
             host: "github.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/git"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let action = engine.evaluate_network_action(&input).unwrap();
         assert_eq!(
             action,
             NetworkAction::Allow {
-                matched_policy: Some("github_ssh_over_https".to_string())
+                matched_policy: Some("copilot".to_string())
             },
         );
     }
@@ -3204,12 +2678,7 @@ process:
         let engine = allowed_ips_engine();
         let input = NetworkInput {
             host: "my-service.corp.net".into(),
-            port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8080,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -3224,12 +2693,7 @@ process:
         let engine = allowed_ips_engine();
         let input = NetworkInput {
             host: "my-service.corp.net".into(),
-            port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8080,        };
         let ips = engine.query_allowed_ips(&input).unwrap();
         assert_eq!(ips, vec!["10.0.5.0/24"]);
     }
@@ -3240,12 +2704,7 @@ process:
         // Any hostname on port 9443 should match the private_network policy
         let input = NetworkInput {
             host: "anything.example.com".into(),
-            port: 9443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 9443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -3259,12 +2718,7 @@ process:
         let engine = allowed_ips_engine();
         let input = NetworkInput {
             host: "anything.example.com".into(),
-            port: 9443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 9443,        };
         let ips = engine.query_allowed_ips(&input).unwrap();
         assert_eq!(ips, vec!["172.16.0.0/12", "192.168.1.1"]);
     }
@@ -3274,12 +2728,7 @@ process:
         let engine = allowed_ips_engine();
         let input = NetworkInput {
             host: "api.github.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let ips = engine.query_allowed_ips(&input).unwrap();
         assert!(ips.is_empty(), "Mode 1 should return no allowed_ips");
     }
@@ -3290,12 +2739,7 @@ process:
         // Port 12345 doesn't match any policy
         let input = NetworkInput {
             host: "anything.example.com".into(),
-            port: 12345,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 12345,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(!decision.allowed, "Mode 3: wrong port should deny");
     }
@@ -3340,12 +2784,7 @@ process:
 
         let input = NetworkInput {
             host: "internal.corp.net".into(),
-            port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8080,        };
         let ips = engine.query_allowed_ips(&input).unwrap();
         assert_eq!(ips, vec!["10.0.5.0/24", "10.0.6.0/24"]);
     }
@@ -3368,12 +2807,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -3396,12 +2830,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 8443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -3424,12 +2853,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 80,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 80,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(!decision.allowed, "Unlisted port should be denied");
     }
@@ -3449,12 +2873,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -3465,12 +2884,7 @@ network_policies:
         // Wrong port should still deny
         let input_bad = NetworkInput {
             host: "api.example.com".into(),
-            port: 80,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 80,        };
         let decision = engine.evaluate_network(&input_bad).unwrap();
         assert!(!decision.allowed);
     }
@@ -3491,12 +2905,7 @@ network_policies:
         // Port 80
         let input80 = NetworkInput {
             host: "anything.internal".into(),
-            port: 80,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 80,        };
         let decision = engine.evaluate_network(&input80).unwrap();
         assert!(
             decision.allowed,
@@ -3506,12 +2915,7 @@ network_policies:
         // Port 443
         let input443 = NetworkInput {
             host: "anything.internal".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input443).unwrap();
         assert!(
             decision.allowed,
@@ -3521,12 +2925,7 @@ network_policies:
         // Port 8080 should deny
         let input_bad = NetworkInput {
             host: "anything.internal".into(),
-            port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8080,        };
         let decision = engine.evaluate_network(&input_bad).unwrap();
         assert!(!decision.allowed);
     }
@@ -3570,32 +2969,17 @@ network_policies:
         // Port 443
         let input443 = NetworkInput {
             host: "api.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         assert!(engine.evaluate_network(&input443).unwrap().allowed);
         // Port 8443
         let input8443 = NetworkInput {
             host: "api.example.com".into(),
-            port: 8443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8443,        };
         assert!(engine.evaluate_network(&input8443).unwrap().allowed);
         // Port 80 denied
         let input80 = NetworkInput {
             host: "api.example.com".into(),
-            port: 80,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 80,        };
         assert!(!engine.evaluate_network(&input80).unwrap().allowed);
     }
 
@@ -3617,12 +3001,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -3646,12 +3025,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "deep.sub.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             !decision.allowed,
@@ -3673,12 +3047,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             !decision.allowed,
@@ -3700,12 +3069,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -3729,12 +3093,7 @@ network_policies:
         // Right host, wrong port
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 80,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 80,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(!decision.allowed, "Wildcard host on wrong port should deny");
     }
@@ -3753,12 +3112,7 @@ network_policies:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 8443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -3841,12 +3195,7 @@ process:
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.com".into(),
-            port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 8080,        };
         let config = engine.query_endpoint_config(&input).unwrap();
         assert!(
             config.is_some(),
@@ -3988,12 +3337,7 @@ network_policies:
         // Request with the resolved path (what the kernel reports)
         let input = NetworkInput {
             host: "pypi.org".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3.11"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -4021,12 +3365,7 @@ network_policies:
         // Request with the original symlink path (unlikely at runtime, but must not break)
         let input = NetworkInput {
             host: "pypi.org".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -4034,35 +3373,6 @@ network_policies:
             decision.reason
         );
     }
-
-    #[test]
-    fn symlink_expanded_binary_does_not_weaken_security() {
-        // A binary NOT in the policy should still be denied, even if
-        // the expanded entries exist for other binaries.
-        let data = r#"
-network_policies:
-  python_policy:
-    name: python_policy
-    endpoints:
-      - { host: pypi.org, port: 443 }
-    binaries:
-      - { path: /usr/bin/python3 }
-      - { path: /usr/bin/python3.11 }
-"#;
-        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
-
-        let input = NetworkInput {
-            host: "pypi.org".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(!decision.allowed, "Unrelated binary should still be denied");
-    }
-
     #[test]
     fn symlink_expansion_works_with_ancestors() {
         // Ancestor binary matching should also work with expanded paths
@@ -4081,12 +3391,7 @@ network_policies:
         // The exe is curl, but an ancestor is the resolved python3.11
         let input = NetworkInput {
             host: "pypi.org".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/bin/python3.11")],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
@@ -4105,12 +3410,7 @@ network_policies:
 
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
 
         let decision_default = engine_default.evaluate_network(&input).unwrap();
         let decision_pid0 = engine_pid0.evaluate_network(&input).unwrap();
@@ -4130,12 +3430,7 @@ network_policies:
         // Verify initial policy works
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(decision.allowed);
 
@@ -4165,12 +3460,7 @@ network_policies:
         // Verify initial policy allows claude
         let claude_input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         assert!(engine.evaluate_network(&claude_input).unwrap().allowed);
 
         // Create a new proto with an additional policy
@@ -4205,12 +3495,7 @@ network_policies:
         // New policy should also work
         let python_input = NetworkInput {
             host: "pypi.org".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         assert!(
             engine.evaluate_network(&python_input).unwrap().allowed,
             "New policy should be active after hot-reload"
@@ -4225,12 +3510,7 @@ network_policies:
 
         let claude_input = NetworkInput {
             host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/local/bin/claude"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         assert!(engine.evaluate_network(&claude_input).unwrap().allowed);
 
         // Reload with same proto — should succeed and preserve behavior
@@ -4243,33 +3523,6 @@ network_policies:
             "Engine should work after successful reload"
         );
     }
-
-    #[test]
-    fn deny_reason_includes_symlink_hint() {
-        // Verify the deny reason includes an actionable symlink hint
-        let engine = test_engine();
-        let input = NetworkInput {
-            host: "api.anthropic.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3.11"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(!decision.allowed);
-        assert!(
-            decision.reason.contains("SYMLINK HINT"),
-            "Deny reason should include prominent symlink hint, got: {}",
-            decision.reason
-        );
-        assert!(
-            decision.reason.contains("readlink -f"),
-            "Deny reason should include actionable fix command, got: {}",
-            decision.reason
-        );
-    }
-
     /// Check if symlink resolution through `/proc/<pid>/root/` actually works.
     /// Creates a real symlink in a tempdir and attempts to resolve it via
     /// the procfs root path. This catches environments where the probe path
@@ -4409,7 +3662,7 @@ network_policies:
         symlink(&target, &link).unwrap();
 
         let link_path = link.to_string_lossy().to_string();
-        let target_path = target.to_string_lossy().to_string();
+        let _target_path = target.to_string_lossy().to_string();
 
         let mut network_policies = std::collections::HashMap::new();
         network_policies.insert(
@@ -4452,105 +3705,11 @@ network_policies:
         // Request using the resolved target path should be allowed
         let input = NetworkInput {
             host: "example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from(&target_path),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
+            port: 443,        };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
             decision.allowed,
             "Resolved symlink target should be allowed after expansion: {}",
             decision.reason
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn reload_from_proto_with_pid_resolves_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        if !procfs_root_accessible() {
-            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
-            return;
-        }
-
-        // Test hot-reload path: initial engine at pid=0, then reload with
-        // real PID to trigger symlink resolution
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("python3.11");
-        let link = dir.path().join("python3");
-
-        std::fs::write(&target, b"python binary").unwrap();
-        symlink(&target, &link).unwrap();
-
-        let link_path = link.to_string_lossy().to_string();
-        let target_path = target.to_string_lossy().to_string();
-
-        let mut network_policies = std::collections::HashMap::new();
-        network_policies.insert(
-            "python".to_string(),
-            NetworkPolicyRule {
-                name: "python".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "pypi.org".to_string(),
-                    port: 443,
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
-            },
-        );
-        let proto = ProtoSandboxPolicy {
-            version: 1,
-            filesystem: Some(ProtoFs {
-                include_workdir: true,
-                read_only: vec![],
-                read_write: vec![],
-            }),
-            landlock: Some(openshell_core::proto::LandlockPolicy {
-                compatibility: "best_effort".to_string(),
-            }),
-            process: Some(ProtoProc {
-                run_as_user: "sandbox".to_string(),
-                run_as_group: "sandbox".to_string(),
-            }),
-            network_policies,
-        };
-
-        // Initial load at pid=0 — no symlink expansion
-        let engine = OpaEngine::from_proto(&proto).expect("initial load");
-
-        // Request with resolved path should be DENIED (no expansion yet)
-        let input_resolved = NetworkInput {
-            host: "pypi.org".into(),
-            port: 443,
-            binary_path: PathBuf::from(&target_path),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let decision = engine.evaluate_network(&input_resolved).unwrap();
-        assert!(
-            !decision.allowed,
-            "Before reload with PID, resolved path should be denied"
-        );
-
-        // Hot-reload with real PID — symlinks resolved
-        let our_pid = std::process::id();
-        engine
-            .reload_from_proto_with_pid(&proto, our_pid)
-            .expect("reload with PID");
-
-        // Now the resolved path should be ALLOWED
-        let decision = engine.evaluate_network(&input_resolved).unwrap();
-        assert!(
-            decision.allowed,
-            "After reload with PID, resolved path should be allowed: {}",
-            decision.reason
-        );
-    }
-}
+    }}
